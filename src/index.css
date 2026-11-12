@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Fraunces", Georgia, serif;
+  --font-sans: "Nunito Sans", system-ui, sans-serif;
+
+  --color-ink: #0e1838;
+  --color-ink-soft: #1a2752;
+  --color-gold: #e9b949;
+  --color-gold-soft: #f7ead0;
+  --color-gold-text: #7a520c;
+  --color-crimson: #c41e3a;
+  --color-crimson-soft: #fbe4e8;
+  --color-pine: #1d5c46;
+  --color-ivory: #faf7f2;
+  --color-sand: #f0ebe3;
+  --color-text: #141a2e;
+  --color-muted: #565d73;
+  --color-line: #e3ddd2;
+  --color-whatsapp: #1f8f4e;
+  --color-whatsapp-hover: #197a42;
+
+  --shadow-card: 0 1px 2px rgb(14 24 56 / 0.05);
+  --shadow-lift: 0 14px 36px -12px rgb(14 24 56 / 0.3);
+  --shadow-focus-gold: 0 0 0 3px rgb(233 185 73 / 0.3);
+
+  --color-cat-jewellery: #b7862c;
+  --color-cat-fashion: #b4476b;
+  --color-cat-beauty: #8a4fa3;
+  --color-cat-mobiles: #2f6db5;
+  --color-cat-daily: #2f8a55;
+  --color-cat-gifts: #c8573a;
+  --color-cat-services: #4a5a6a;
+
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    @apply bg-ivory font-sans text-text antialiased;
+    font-size: 16px;
+    line-height: 1.6;
+  }
+  h1, h2, h3 {
+    @apply font-display;
+    letter-spacing: -0.01em;
+  }
+  :focus-visible {
+    outline: 3px solid var(--color-gold);
+    outline-offset: 3px;
+    border-radius: 6px;
+  }
+  button, a {
+    touch-action: manipulation;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+.arch-pattern {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='96' viewBox='0 0 80 96'%3E%3Cpath d='M8 96V40a32 32 0 0 1 64 0v56' fill='none' stroke='%23e9b949' stroke-opacity='.22' stroke-width='1.5'/%3E%3Cpath d='M20 96V44a20 20 0 0 1 40 0v52' fill='none' stroke='%23e9b949' stroke-opacity='.12' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-size: 80px 96px;
+}
