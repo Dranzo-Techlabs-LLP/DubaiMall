@@ -57,6 +57,13 @@
   button, a {
     touch-action: manipulation;
   }
+  /* Tailwind v4 resets buttons to the default cursor; staff expect a pointer on anything clickable. */
+  button:not(:disabled), [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: not-allowed;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

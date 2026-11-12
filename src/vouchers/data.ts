@@ -47,6 +47,16 @@ export const places = [
 
 export type IssueStatus = 'sent' | 'pending'
 
+/** A sponsor printed on the coupon: their shop name and logo (small data URL). */
+export interface Sponsor {
+  /** Derived from name + image, so editing either makes a new version and old vouchers keep theirs. */
+  id: string
+  /** Shop name. */
+  name: string
+  /** Logo. */
+  image: string
+}
+
 /** A purchase that earned vouchers. */
 export interface Issue {
   id: string
@@ -59,6 +69,84 @@ export interface Issue {
   codes: string[]
   status: IssueStatus
   sentAt?: string
+  /** Ids into the sponsor library — images are stored once there, not copied onto every voucher. */
+  sponsorIds?: string[]
+  /** Public link that downloads the coupon image, once it has been uploaded. */
+  couponUrl?: string
+}
+
+/**
+ * Shrinks an uploaded sponsor logo or photo so it fits in localStorage. The whole image is kept
+ * (no cropping, aspect ratio preserved). Logos with a transparent background stay PNG;
+ * everything else (photos) becomes JPEG, which is far smaller.
+ */
+export async function sponsorImage(file: File, maxW = 360, maxH = 270): Promise<string> {
+  const bitmap = await createImageBitmap(file)
+  const scale = Math.min(1, maxW / bitmap.width, maxH / bitmap.height)
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale))
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale))
+  const ctx = canvas.getContext('2d')!
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+  bitmap.close()
+  const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height)
+  for (let i = 3; i < data.length; i += 4) {
+    if (data[i] < 250) return canvas.toDataURL('image/png')
+  }
+  return canvas.toDataURL('image/jpeg', 0.85)
+}
+
+export function sponsorId(name: string, image: string) {
+  let h = 5381
+  const s = `${name}\n${image}`
+  for (let i = 0; i < s.length; i++) h = (Math.imul(h, 33) ^ s.charCodeAt(i)) >>> 0
+  return `sp-${h.toString(36)}-${s.length.toString(36)}`
+}
+
+// ---------- sponsors ----------
+// The library holds every sponsor version ever put on a voucher, so old vouchers can still show theirs.
+// The active list is what the form starts with: the same sponsors usually go on every coupon.
+
+const LIBRARY_KEY = 'dme-voucher-sponsor-library-v1'
+const ACTIVE_KEY = 'dme-voucher-sponsors-v2'
+
+function readJson<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key)
+    if (raw) return JSON.parse(raw) as T
+  } catch {
+    // storage blocked or corrupt
+  }
+  return fallback
+}
+
+function writeJson(key: string, value: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    // storage blocked or full — still works in memory for this session
+  }
+}
+
+let library: Record<string, Sponsor> | null = null
+const getLibrary = () => (library ??= readJson<Record<string, Sponsor>>(LIBRARY_KEY, {}))
+
+export const sponsorsFor = (issue: Issue): Sponsor[] =>
+  (issue.sponsorIds ?? []).map((id) => getLibrary()[id]).filter(Boolean)
+
+export const loadActiveSponsors = (): Sponsor[] => readJson<Sponsor[]>(ACTIVE_KEY, [])
+
+/** Overwrites the form's saved sponsor list (no history kept — that's what the library is for). */
+export const setActiveSponsors = (sponsors: Sponsor[]) => writeJson(ACTIVE_KEY, sponsors)
+
+/** Adds sponsors to the library when they go on a voucher, and returns their ids for the issue. */
+export function rememberSponsors(sponsors: Sponsor[]) {
+  const lib = getLibrary()
+  if (sponsors.some((s) => !lib[s.id])) {
+    for (const s of sponsors) lib[s.id] = s
+    writeJson(LIBRARY_KEY, lib)
+  }
+  return sponsors.map((s) => s.id)
 }
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -173,6 +261,8 @@ export function useIssues() {
         setIssues((list) =>
           list.map((i) => (i.id === id ? { ...i, status: 'sent' as const, sentAt: new Date().toISOString() } : i)),
         ),
+      setCouponUrl: (id: string, couponUrl: string) =>
+        setIssues((list) => list.map((i) => (i.id === id ? { ...i, couponUrl } : i))),
       reset: () => setIssues(seedIssues()),
     }),
     [],
@@ -187,19 +277,28 @@ export type WhatsAppTarget = 'web' | 'app'
 
 export const inr = (n: number) => `₹${n.toLocaleString('en-IN')}`
 
+/** The greeting sent with the coupon image. WhatsApp shows *text* as bold. */
 export function voucherMessage(issue: Issue) {
   const shop = shopById[issue.shopId]
   const n = issue.codes.length
+  const sponsors = sponsorsFor(issue)
   return [
-    `*Dubai Mall Edakkara — ${festival.name}*`,
+    `🎄 *Merry Christmas & Happy New Year, ${issue.customerName}!* ✨`,
     '',
-    `Hi ${issue.customerName}, thank you for shopping at *${shop.name}* (Shop ${shop.shopNo}, ${shop.floor}).`,
+    `Thank you for shopping at *${shop.name}* (Shop ${shop.shopNo}, ${shop.floor}) during the Dubai Mall Edakkara ${festival.name}.`,
     ...(issue.billNo ? [`Bill ${issue.billNo}`] : []),
     '',
-    `Your ${n} lucky-draw voucher${n === 1 ? '' : 's'}:`,
-    ...issue.codes.map((c, i) => `${i + 1}. ${c}`),
+    `🎟️ Your ${n} lucky-draw voucher${n === 1 ? '' : 's'}:`,
+    ...issue.codes.map((c, i) => `${i + 1}. *${c}*`),
     '',
-    `${festival.drawLabel}. Keep this message to claim your prize.`,
+    ...(issue.couponUrl
+      ? ['📥 *View & download your coupon:*', issue.couponUrl, '', 'Save it to your phone and keep this message to claim your prize.']
+      : ['Your coupon is attached as an image — save it to your phone and keep this message to claim your prize.']),
+    `🏆 ${festival.drawLabel}.`,
+    ...(sponsors.length ? ['', `Sponsored by: ${sponsors.map((s) => s.name).join(', ')}`] : []),
+    '',
+    'Wishing you and your family a joyful season! 🎁',
+    '— Dubai Mall Edakkara',
   ].join('\n')
 }
 
