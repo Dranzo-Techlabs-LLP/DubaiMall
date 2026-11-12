@@ -466,7 +466,15 @@ function IssueForm({
               />
             </Field>
             <Field label="Place" optional>
-              <input value={place} onChange={(e) => setPlace(e.target.value)} list="dme-places" placeholder="Edakkara" className={inputCls} />
+              {/* The hint starts with "e.g." so an empty box is never mistaken for a filled-in place. */}
+              <input
+                value={place}
+                onChange={(e) => setPlace(e.target.value)}
+                list="dme-places"
+                placeholder="e.g. Edakkara — type or pick"
+                autoComplete="off"
+                className={`${inputCls} placeholder:text-muted/60`}
+              />
               <datalist id="dme-places">
                 {places.map((p) => (
                   <option key={p} value={p} />
