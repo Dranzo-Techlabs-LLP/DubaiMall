@@ -8,3 +8,4 @@ dist
 .env.*.local
 server/.env
 server/data/
+deploy/out/

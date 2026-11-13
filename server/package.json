@@ -1,0 +1,12 @@
+{
+  "name": "dubai-mall-coupon-server",
+  "private": true,
+  "description": "Coupon link server for the Dubai Mall Edakkara voucher desk. No dependencies.",
+  "main": "app.js",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

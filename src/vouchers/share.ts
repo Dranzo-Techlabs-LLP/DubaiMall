@@ -12,13 +12,23 @@ import { getFontEmbedCSS, toBlob } from 'html-to-image'
 
 // ---------- coupon server (server/index.mjs) ----------
 
+declare global {
+  interface Window {
+    /** Set by /desk-config.js, which the deploy script writes on the server (see deploy/). */
+    DME_DESK_CONFIG?: { couponApiUrl?: string; couponApiKey?: string }
+  }
+}
+
+// The live server's details come from /desk-config.js at runtime, so the same build works anywhere
+// and no key is baked into the bundle. Locally, .env.local fills them in instead.
 const api = (() => {
-  const url = import.meta.env.VITE_COUPON_API_URL?.replace(/\/+$/, '')
-  const key = import.meta.env.VITE_COUPON_API_KEY
+  const runtime = typeof window === 'undefined' ? undefined : window.DME_DESK_CONFIG
+  const url = (runtime?.couponApiUrl || import.meta.env.VITE_COUPON_API_URL)?.replace(/\/+$/, '')
+  const key = runtime?.couponApiKey || import.meta.env.VITE_COUPON_API_KEY
   return url && key ? { url, key } : null
 })()
 
-/** True when download links are switched on (coupon server details are in .env.local). */
+/** True when download links are switched on (desk-config.js on the server, or .env.local locally). */
 export const couponLinksEnabled = api !== null
 
 /** What the coupon server stores alongside the image, for the customer's coupon page. */

@@ -4,18 +4,27 @@
 // link (/c/<id>) for the WhatsApp greeting. The link opens a page with the coupon and a Download
 // button, and carries Open Graph tags so WhatsApp can show the coupon as a link preview.
 //
-// Runs on plain Node (24+) with no dependencies: node:http + node:sqlite.
-// Configure with server/.env (see server/.env.example) and start with `npm run server`.
+// Plain Node with no dependencies. Stores coupons in SQLite (node:sqlite, Node 22.13+) when the
+// Node version has it, otherwise as files — so it also runs on older Node versions on cPanel.
+// Configure with .env next to this file (see .env.example) and start with `npm run server`,
+// or on cPanel as a Node.js app with startup file app.js.
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { networkInterfaces } from 'node:os'
 import { dirname, join } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
+
+// Settings from .env next to this file. cPanel starts the app without command-line flags,
+// so the server loads it itself. Real environment variables win over the file.
+try {
+  process.loadEnvFile(join(here, '.env'))
+} catch {
+  // no .env (or Node older than 20.12): use the real environment variables
+}
 
 // ---------- config ----------
 
@@ -23,7 +32,7 @@ const PORT = Number(process.env.PORT || 8787)
 const HOST = process.env.HOST || '0.0.0.0'
 /** Shared secret the desk sends in X-Desk-Key. Only the desk may upload coupons. */
 const DESK_KEY = process.env.DESK_KEY || ''
-const DB_FILE = process.env.DB_FILE || join(here, 'data', 'coupons.db')
+const DATA_DIR = process.env.DATA_DIR || join(here, 'data')
 /** Pages allowed to call the upload API (the voucher desk). */
 const DESK_ORIGINS = (process.env.DESK_ORIGINS || 'http://localhost:5173')
   .split(',')
@@ -48,32 +57,96 @@ function lanAddress() {
   return 'localhost'
 }
 
-// ---------- database ----------
+// ---------- storage ----------
+// SQLite when this Node has it (22.13+); otherwise one PNG + one JSON file per coupon.
+// Force one with COUPON_STORE=sqlite or COUPON_STORE=files.
 
-mkdirSync(dirname(DB_FILE), { recursive: true })
-const db = new DatabaseSync(DB_FILE)
-db.exec(`
-  pragma journal_mode = wal;
-  create table if not exists coupons (
-    id          text primary key,           -- random, used in the public link
-    issue_id    text not null unique,       -- the desk's purchase id: one coupon per purchase
-    customer    text not null,
-    shop        text not null,
-    codes       text not null,              -- JSON array of voucher codes
-    festival    text not null,
-    draw_label  text not null,
-    png         blob not null,
-    width       integer not null,
-    height      integer not null,
-    created_at  text not null default (datetime('now'))
-  );
-`)
-const findByIssue = db.prepare('select id from coupons where issue_id = ?')
-const findById = db.prepare('select * from coupons where id = ?')
-const insertCoupon = db.prepare(`
-  insert into coupons (id, issue_id, customer, shop, codes, festival, draw_label, png, width, height)
-  values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`)
+const store = await openStore()
+
+async function openStore() {
+  if (process.env.COUPON_STORE !== 'files') {
+    try {
+      const { DatabaseSync } = await import('node:sqlite')
+      return sqliteStore(DatabaseSync)
+    } catch (err) {
+      if (process.env.COUPON_STORE === 'sqlite') throw err
+    }
+  }
+  return fileStore()
+}
+
+function sqliteStore(DatabaseSync) {
+  const file = process.env.DB_FILE || join(DATA_DIR, 'coupons.db')
+  mkdirSync(dirname(file), { recursive: true })
+  const db = new DatabaseSync(file)
+  db.exec(`
+    pragma journal_mode = wal;
+    create table if not exists coupons (
+      id          text primary key,           -- random, used in the public link
+      issue_id    text not null unique,       -- the desk's purchase id: one coupon per purchase
+      customer    text not null,
+      shop        text not null,
+      codes       text not null,              -- JSON array of voucher codes
+      festival    text not null,
+      draw_label  text not null,
+      png         blob not null,
+      width       integer not null,
+      height      integer not null,
+      created_at  text not null
+    );
+  `)
+  const byIssue = db.prepare('select id from coupons where issue_id = ?')
+  const byId = db.prepare('select * from coupons where id = ?')
+  const insert = db.prepare(`
+    insert into coupons (id, issue_id, customer, shop, codes, festival, draw_label, png, width, height, created_at)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+  return {
+    kind: `SQLite database ${file}`,
+    idForIssue: (issueId) => byIssue.get(issueId)?.id,
+    get: (id) => byId.get(id),
+    add: (c) =>
+      insert.run(c.id, c.issue_id, c.customer, c.shop, c.codes, c.festival, c.draw_label, c.png, c.width, c.height, c.created_at),
+  }
+}
+
+function fileStore() {
+  const dir = join(DATA_DIR, 'coupons')
+  mkdirSync(dir, { recursive: true })
+  const issues = new Map()
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.json')) continue
+    try {
+      const meta = JSON.parse(readFileSync(join(dir, name), 'utf8'))
+      issues.set(meta.issue_id, meta.id)
+    } catch {
+      // skip a damaged file
+    }
+  }
+  // Write to a temp file and rename, so a crash never leaves half a coupon.
+  const save = (path, data) => {
+    writeFileSync(`${path}.tmp`, data)
+    renameSync(`${path}.tmp`, path)
+  }
+  return {
+    kind: `files in ${dir}`,
+    idForIssue: (issueId) => issues.get(issueId),
+    get: (id) => {
+      try {
+        const meta = JSON.parse(readFileSync(join(dir, `${id}.json`), 'utf8'))
+        return { ...meta, png: readFileSync(join(dir, `${id}.png`)) }
+      } catch {
+        return undefined
+      }
+    },
+    add: (c) => {
+      const { png, ...meta } = c
+      save(join(dir, `${c.id}.png`), png)
+      save(join(dir, `${c.id}.json`), JSON.stringify(meta))
+      issues.set(c.issue_id, c.id)
+    },
+  }
+}
 
 // ---------- helpers ----------
 
@@ -255,10 +328,22 @@ async function handle(req, res) {
     if (!keyMatches(req.headers['x-desk-key'])) return sendJson(res, 401, { error: 'Wrong desk key' }, cors)
     const coupon = parseCoupon(await readBody(req))
     // Sending again for the same purchase reuses its link.
-    const existing = findByIssue.get(coupon.issueId)
-    if (existing) return sendJson(res, 200, { id: existing.id, url: linkFor(existing.id) }, cors)
+    const existing = store.idForIssue(coupon.issueId)
+    if (existing) return sendJson(res, 200, { id: existing, url: linkFor(existing) }, cors)
     const id = randomBytes(9).toString('base64url') // 12 characters, unguessable
-    insertCoupon.run(id, coupon.issueId, coupon.customer, coupon.shop, JSON.stringify(coupon.codes), coupon.festival, coupon.drawLabel, coupon.png, coupon.width, coupon.height)
+    store.add({
+      id,
+      issue_id: coupon.issueId,
+      customer: coupon.customer,
+      shop: coupon.shop,
+      codes: JSON.stringify(coupon.codes),
+      festival: coupon.festival,
+      draw_label: coupon.drawLabel,
+      png: coupon.png,
+      width: coupon.width,
+      height: coupon.height,
+      created_at: new Date().toISOString(),
+    })
     console.log(`coupon ${id} saved · ${coupon.customer} · ${coupon.codes.length} code(s)`)
     return sendJson(res, 201, { id, url: linkFor(id) }, cors)
   }
@@ -269,7 +354,7 @@ async function handle(req, res) {
 
   const match = couponRoute.exec(url.pathname)
   if (match) {
-    const coupon = findById.get(match[1])
+    const coupon = store.get(match[1])
     if (!coupon) return send(res, 404, notFoundPage, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': PAGE_CSP })
     if (match[2]) {
       const headers = {
@@ -305,4 +390,5 @@ server.listen(PORT, HOST, () => {
   console.log(`Coupon server listening on ${HOST}:${PORT}`)
   console.log(`Coupon links will look like ${PUBLIC_URL}/c/<id>`)
   console.log(`Desk allowed from: ${DESK_ORIGINS.join(', ')}`)
+  console.log(`Coupons stored as ${store.kind}`)
 })
