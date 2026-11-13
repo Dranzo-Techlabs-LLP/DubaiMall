@@ -8,12 +8,14 @@ import {
   Download,
   ExternalLink,
   ImageDown,
-  Link2,
   ImagePlus,
+  Link2,
+  LogOut,
   Plus,
-  RotateCcw,
+  RefreshCw,
   Search,
   Share2,
+  Shield,
   Store,
   Ticket,
   Users,
@@ -25,39 +27,40 @@ import { flushSync } from 'react-dom'
 import { WhatsAppIcon } from '../components/ShopCard'
 import { festival } from '../data/festival'
 import {
-  allCodes,
+  apiConfigured,
+  createIssue,
+  getSponsors,
+  hasSession,
+  listIssues,
+  logout,
+  markSent,
+  me,
+  onSessionExpired,
+  saveSponsors,
+  uploadCoupon,
+  type NewIssue,
+  type User,
+} from './api'
+import { Coupon } from './Coupon'
+import {
   eligibleVouchers,
   inr,
-  loadActiveSponsors,
-  makeCode,
   places,
-  rememberSponsors,
   RUPEES_PER_VOUCHER,
-  setActiveSponsors,
   shopById,
-  sponsorId,
+  shopRows,
   sponsorImage,
   sponsorsFor,
-  shopRows,
-  useIssues,
   voucherMessage,
   whatsappUrl,
   type Issue,
   type Sponsor,
   type WhatsAppTarget,
 } from './data'
-import { Coupon } from './Coupon'
 import { PurchaseGrid, ShopGrid, VoucherGrid } from './grids'
-import {
-  canShareImage,
-  copyImage,
-  couponFileName,
-  couponLinksEnabled,
-  downloadImage,
-  nodeToPng,
-  shareImage,
-  uploadCoupon,
-} from './share'
+import { Login } from './Login'
+import { canShareImage, copyImage, couponFileName, downloadImage, nodeToPng, shareImage } from './share'
+import { ShopLogins } from './ShopLogins'
 
 /** What the form currently holds — drives the live coupon preview. */
 interface Draft {
@@ -73,7 +76,7 @@ const shopLabel = (shopId: string) => {
   return s ? `${s.shopNo} · ${s.name}` : ''
 }
 
-type Tab = 'vouchers' | 'purchases' | 'shops'
+type Tab = 'vouchers' | 'purchases' | 'shops' | 'logins'
 
 /** Accepts "98470 12345", "+91 9847012345", "09847012345" … returns the 10-digit mobile or null. */
 function normalisePhone(raw: string) {
@@ -87,23 +90,122 @@ function normalisePhone(raw: string) {
 const WA_WINDOW = 'dme-whatsapp'
 
 /** How the coupon image went out on the last send. */
-type SendResult = 'linked' | 'upload-failed' | 'copied' | 'manual'
+type SendResult = 'linked' | 'upload-failed'
 
-/** What the coupon server keeps with the image, for the customer's coupon page. */
+/** Labels for the customer's coupon page; the server takes the codes and name from the saved voucher. */
 const couponUpload = (i: Issue) => {
   const shop = shopById[i.shopId]
   return {
     issueId: i.id,
-    customer: i.customerName,
-    shop: `${shop.name} (Shop ${shop.shopNo})`,
-    codes: i.codes,
+    shop: shop ? `${shop.name} (Shop ${shop.shopNo})` : i.shopId,
     festival: festival.name,
     drawLabel: festival.drawLabel,
   }
 }
 
+const errorText = (err: unknown, fallback = 'Something went wrong') => (err instanceof Error && err.message) || fallback
+
+/** Closes a tab we opened for WhatsApp only while it's still blank — never a WhatsApp tab in use. */
+function closeIfBlank(tab: Window | null) {
+  try {
+    if (tab && tab.location.href === 'about:blank') tab.close()
+  } catch {
+    // cross-origin: it's already WhatsApp, leave it open
+  }
+}
+
+/** Login gate: the sign-in screen until a shop or the mall admin is logged in. */
 export function VoucherApp() {
-  const { issues, add, markSent, setCouponUrl, reset } = useIssues()
+  const [user, setUser] = useState<User | null>(null)
+  const [checking, setChecking] = useState(() => apiConfigured && hasSession())
+  const [notice, setNotice] = useState('')
+
+  useEffect(() => {
+    if (!checking) return
+    me()
+      .then(setUser)
+      .catch(() => setUser(null))
+      .finally(() => setChecking(false))
+  }, [checking])
+
+  useEffect(
+    () =>
+      onSessionExpired(() => {
+        setUser(null)
+        setNotice('You were logged out. Please log in again.')
+      }),
+    [],
+  )
+
+  if (!apiConfigured) return <NotConnected />
+  if (checking) {
+    return <div className="grid min-h-dvh place-items-center bg-ink text-sm text-white/70">Loading the voucher desk…</div>
+  }
+  if (!user) {
+    return (
+      <Login
+        notice={notice}
+        onLogin={(u) => {
+          setNotice('')
+          setUser(u)
+        }}
+      />
+    )
+  }
+  return (
+    <Desk
+      key={user.username}
+      user={user}
+      onLogout={async () => {
+        await logout()
+        setUser(null)
+      }}
+    />
+  )
+}
+
+function NotConnected() {
+  return (
+    <div className="grid min-h-dvh place-items-center bg-ivory px-4">
+      <div className="max-w-md rounded-2xl border border-line bg-white p-6 text-center shadow-card">
+        <h1 className="text-xl font-semibold text-ink">The voucher desk isn't connected</h1>
+        <p className="mt-2 text-sm text-muted">
+          It can't find its server address. On the live site, run deploy.sh again. Locally, set VITE_COUPON_API_URL in
+          .env.local and start <code>npm run server</code>.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+/** Vouchers for the logged-in shop (or every shop, for the admin), loaded from the server. */
+function useIssues() {
+  const [issues, setIssues] = useState<Issue[] | null>(null)
+  const [error, setError] = useState('')
+  const reload = useCallback(async () => {
+    try {
+      setIssues(await listIssues())
+      setError('')
+    } catch (err) {
+      setError(errorText(err, 'Could not load the vouchers'))
+    }
+  }, [])
+  useEffect(() => void reload(), [reload])
+  const upsert = useCallback(
+    (i: Issue) =>
+      setIssues((list) => {
+        const l = list ?? []
+        return l.some((x) => x.id === i.id) ? l.map((x) => (x.id === i.id ? i : x)) : [i, ...l]
+      }),
+    [],
+  )
+  return { issues: issues ?? [], error, reload, upsert }
+}
+
+function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
+  const admin = user.role === 'admin'
+  const myShop = user.shopId ? shopById[user.shopId] : undefined
+  const { issues, error: loadError, reload, upsert } = useIssues()
   const [target, setTarget] = useState<WhatsAppTarget>('web')
   const [last, setLast] = useState<Issue | null>(null)
   const [sendResult, setSendResult] = useState<SendResult | null>(null)
@@ -117,37 +219,24 @@ export function VoucherApp() {
     const customers = new Set(issues.map((i) => i.phone)).size
     const shops = new Set(issues.map((i) => i.shopId)).size
     const pending = issues.filter((i) => i.status === 'pending').length
-    return { vouchers, customers, shops, pending, purchases: issues.length }
+    const today = new Date().toDateString()
+    const issuedToday = issues
+      .filter((i) => new Date(i.createdAt).toDateString() === today)
+      .reduce((n, i) => n + i.codes.length, 0)
+    return { vouchers, customers, shops, pending, issuedToday, purchases: issues.length }
   }, [issues])
 
   /**
-   * Opens the customer's chat with the greeting typed in.
-   * With coupon storage set up, the coupon PNG is uploaded first and the greeting carries its
-   * download link. Without it, the image is copied for staff to paste (Ctrl+V) into the chat.
+   * Uploads the coupon image (once per purchase), then points the WhatsApp tab at the customer's chat
+   * with the greeting and the coupon link typed in, and marks the voucher sent.
+   * `opened` is a tab already opened during the click (so pop-up blockers allow it).
    */
   const send = useCallback(
-    async (i: Issue) => {
+    async (i: Issue, opened?: Window | null) => {
       // Render the hidden coupon for this purchase right away so it can be turned into a PNG.
       flushSync(() => setLast(i))
       const node = captureNode()
-
-      const finish = (sent: Issue, opened: Window | null) => {
-        if (!opened) return setLast(sent) // pop-up blocked: stays "not yet sent"
-        markSent(sent.id)
-        setLast({ ...sent, status: 'sent', sentAt: new Date().toISOString() })
-      }
-
-      if (!couponLinksEnabled) {
-        // Copy before opening the chat: the clipboard only accepts writes while this page has focus.
-        const copied = node ? await copyImage(nodeToPng(node)) : false
-        setSendResult(copied ? 'copied' : 'manual')
-        finish(i, window.open(whatsappUrl(i, target), WA_WINDOW))
-        return
-      }
-
-      // Open the WhatsApp tab now, while the click still counts for the pop-up blocker,
-      // and point it at the chat once the coupon link is ready.
-      const tab = window.open('', WA_WINDOW)
+      const tab = opened === undefined ? window.open('', WA_WINDOW) : opened
       let ready = i
       if (i.couponUrl) {
         setSendResult('linked')
@@ -156,35 +245,49 @@ export function VoucherApp() {
           if (!node) throw new Error('Coupon not rendered')
           const url = await uploadCoupon(await nodeToPng(node), couponUpload(i))
           ready = { ...i, couponUrl: url }
-          setCouponUrl(i.id, url)
+          upsert(ready)
           setSendResult('linked')
         } catch {
           setSendResult('upload-failed')
         }
       }
-      if (tab) tab.location.href = whatsappUrl(ready, target)
-      finish(ready, tab)
+      if (!tab) return setLast(ready) // pop-up blocked: stays "not yet sent"
+      tab.location.href = whatsappUrl(ready, target)
+      try {
+        const sent = await markSent(ready.id)
+        upsert(sent)
+        setLast(sent)
+      } catch {
+        setLast({ ...ready, status: 'sent', sentAt: new Date().toISOString() })
+      }
     },
-    [target, markSent, setCouponUrl],
+    [target, upsert],
   )
 
-  const issue = (draft: Omit<Issue, 'id' | 'createdAt' | 'codes' | 'status'>, count: number) => {
-    const taken = allCodes(issues)
-    const created: Issue = {
-      ...draft,
-      id: `iss-${Date.now()}`,
-      createdAt: new Date().toISOString(),
-      codes: Array.from({ length: count }, () => makeCode(taken)),
-      status: 'pending',
+  /** Saves the voucher on the server (which makes the codes), then sends it. Returns an error message, or null. */
+  const issue = async (newIssue: NewIssue, beforeCreate: () => Promise<void>): Promise<string | null> => {
+    const tab = window.open('', WA_WINDOW) // open now, while the click still counts
+    try {
+      await beforeCreate()
+      const created = await createIssue(newIssue)
+      upsert(created)
+      void send(created, tab)
+      return null
+    } catch (err) {
+      closeIfBlank(tab)
+      return errorText(err, 'Could not save the voucher')
     }
-    add(created)
-    void send(created)
   }
 
-  const tabs: { id: Tab; label: string; count: number }[] = [
+  const tabs: { id: Tab; label: string; count?: number }[] = [
     { id: 'vouchers', label: 'Vouchers', count: stats.vouchers },
     { id: 'purchases', label: 'Customers', count: stats.purchases },
-    { id: 'shops', label: 'Shop-wise', count: shopRows.length },
+    ...(admin
+      ? [
+          { id: 'shops' as const, label: 'Shop-wise', count: shopRows.length },
+          { id: 'logins' as const, label: 'Shop logins' },
+        ]
+      : []),
   ]
 
   return (
@@ -203,23 +306,21 @@ export function VoucherApp() {
               </p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="hidden rounded-full bg-white/10 px-3 py-1 text-xs font-bold uppercase tracking-wide text-gold sm:inline">
-              Mock data
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-2 rounded-full bg-white/10 py-1 pl-1 pr-3 text-sm">
+              <span className="grid size-7 place-items-center rounded-full bg-gold text-ink">
+                {admin ? <Shield className="size-4" aria-hidden /> : <Store className="size-4" aria-hidden />}
+              </span>
+              <span className="font-semibold">{admin ? 'Mall admin' : myShop ? `${myShop.shopNo} · ${myShop.name}` : user.username}</span>
             </span>
             <button
               type="button"
-              onClick={() => {
-                if (confirm('Replace all vouchers with fresh demo data?')) {
-                  reset()
-                  setLast(null)
-                }
-              }}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-white/20 px-3 py-2 text-sm font-semibold hover:bg-white/10"
+              onClick={onLogout}
+              className="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-white/20 px-3 text-sm font-semibold hover:bg-white/10"
             >
-              <RotateCcw className="size-4" /> Reset demo
+              <LogOut className="size-4" aria-hidden /> Log out
             </button>
-            <a href="/" className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold text-white/80 hover:text-white">
+            <a href="/" className="inline-flex min-h-10 items-center gap-1.5 rounded-lg px-3 text-sm font-semibold text-white/80 hover:text-white">
               <ArrowLeft className="size-4" /> Mall site
             </a>
           </div>
@@ -227,10 +328,23 @@ export function VoucherApp() {
       </header>
 
       <main className="mx-auto max-w-[1400px] space-y-6 px-4 py-6 sm:px-6">
+        {loadError && (
+          <p role="alert" className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-crimson-soft px-4 py-3 text-sm font-semibold text-crimson">
+            {loadError}
+            <button type="button" onClick={() => void reload()} className="min-h-10 rounded-lg bg-white px-3 text-ink">
+              Try again
+            </button>
+          </p>
+        )}
+
         <section aria-label="Totals" className="grid grid-cols-2 gap-3 lg:grid-cols-4">
           <Stat icon={Ticket} label="Vouchers issued" value={stats.vouchers.toLocaleString('en-IN')} />
           <Stat icon={Users} label="Customers" value={stats.customers.toLocaleString('en-IN')} />
-          <Stat icon={Store} label="Shops issuing" value={`${stats.shops} / ${shopRows.length}`} />
+          {admin ? (
+            <Stat icon={Store} label="Shops issuing" value={`${stats.shops} / ${shopRows.length}`} />
+          ) : (
+            <Stat icon={CheckCircle2} label="Issued today" value={stats.issuedToday.toLocaleString('en-IN')} />
+          )}
           <Stat
             icon={Clock}
             label="Not yet sent"
@@ -241,7 +355,7 @@ export function VoucherApp() {
         </section>
 
         <div className="grid items-start gap-6 lg:grid-cols-[440px_1fr]">
-          <IssueForm target={target} onTarget={setTarget} onIssue={issue} onDraft={setDraft} />
+          <IssueForm user={user} target={target} onTarget={setTarget} onIssue={issue} onDraft={setDraft} />
           {/* Only the short preview sticks; the issued list can be taller than the screen. */}
           <div className={last ? undefined : 'lg:sticky lg:top-6'}>
             {last ? (
@@ -254,7 +368,7 @@ export function VoucherApp() {
 
         <section aria-label="Records" className="space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div role="tablist" className="flex rounded-xl bg-sand p-1">
+            <div role="tablist" className="flex flex-wrap rounded-xl bg-sand p-1">
               {tabs.map((t) => (
                 <button
                   key={t.id}
@@ -266,36 +380,49 @@ export function VoucherApp() {
                     tab === t.id ? 'bg-white text-ink shadow-card' : 'text-muted hover:text-ink'
                   }`}
                 >
-                  {t.label} <span className="ml-1 text-xs font-semibold text-muted">{t.count}</span>
+                  {t.label} {t.count !== undefined && <span className="ml-1 text-xs font-semibold text-muted">{t.count}</span>}
                 </button>
               ))}
             </div>
-            <div className="flex flex-1 items-center justify-end gap-2">
-              <label className="relative w-full max-w-xs">
-                <span className="sr-only">Search records</span>
-                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted" />
-                <input
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Search code, customer, shop…"
-                  className="w-full rounded-lg border border-line bg-white py-2 pl-9 pr-3 text-sm outline-none focus:border-gold focus:shadow-focus-gold"
-                />
-              </label>
-              <button
-                type="button"
-                onClick={() => gridApi.current?.exportDataAsCsv({ fileName: `dme-${tab}.csv` })}
-                className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-line bg-white px-3 py-2 text-sm font-semibold text-ink hover:bg-sand"
-              >
-                <Download className="size-4" /> CSV
-              </button>
-            </div>
+            {tab !== 'logins' && (
+              <div className="flex flex-1 items-center justify-end gap-2">
+                <label className="relative w-full max-w-xs">
+                  <span className="sr-only">Search records</span>
+                  <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted" />
+                  <input
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Search code, customer, shop…"
+                    className="w-full rounded-lg border border-line bg-white py-2 pl-9 pr-3 text-sm outline-none focus:border-gold focus:shadow-focus-gold"
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={() => void reload()}
+                  aria-label="Refresh records"
+                  className="grid size-10 shrink-0 place-items-center rounded-lg border border-line bg-white text-ink hover:bg-sand"
+                >
+                  <RefreshCw className="size-4" aria-hidden />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => gridApi.current?.exportDataAsCsv({ fileName: `dme-${tab}.csv` })}
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-line bg-white px-3 py-2 text-sm font-semibold text-ink hover:bg-sand"
+                >
+                  <Download className="size-4" /> CSV
+                </button>
+              </div>
+            )}
           </div>
 
           {tab === 'vouchers' && <VoucherGrid issues={issues} search={search} onReady={(api) => (gridApi.current = api)} />}
           {tab === 'purchases' && (
-            <PurchaseGrid issues={issues} search={search} onReady={(api) => (gridApi.current = api)} onSend={send} />
+            <PurchaseGrid issues={issues} search={search} onReady={(api) => (gridApi.current = api)} onSend={(i) => void send(i)} />
           )}
-          {tab === 'shops' && <ShopGrid issues={issues} search={search} onReady={(api) => (gridApi.current = api)} />}
+          {tab === 'shops' && admin && (
+            <ShopGrid issues={issues} search={search} onReady={(api) => (gridApi.current = api)} />
+          )}
+          {tab === 'logins' && admin && <ShopLogins me={user} />}
         </section>
       </main>
     </div>
@@ -338,28 +465,32 @@ function Stat({
 // ---------- form ----------
 
 function IssueForm({
+  user,
   target,
   onTarget,
   onIssue,
   onDraft,
 }: {
+  user: User
   target: WhatsAppTarget
   onTarget: (t: WhatsAppTarget) => void
-  onIssue: (draft: Omit<Issue, 'id' | 'createdAt' | 'codes' | 'status'>, count: number) => void
+  onIssue: (issue: NewIssue, beforeCreate: () => Promise<void>) => Promise<string | null>
   onDraft: (draft: Draft) => void
 }) {
+  const admin = user.role === 'admin'
   const [phone, setPhone] = useState('')
   const [name, setName] = useState('')
   const [place, setPlace] = useState('')
-  const [shopId, setShopId] = useState('')
+  // A shop always issues for itself; only the mall admin picks the shop.
+  const [shopId, setShopId] = useState(user.shopId ?? '')
   const [billNo, setBillNo] = useState('')
   const [amount, setAmount] = useState('')
   const [count, setCount] = useState(0)
-  const [sponsorRows, setSponsorRows] = useState<SponsorRow[]>(() => {
-    const saved = loadActiveSponsors()
-    return saved.length ? saved.map(sponsorRow) : [sponsorRow()]
-  })
   const [tried, setTried] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [formError, setFormError] = useState('')
+  const sponsorsState = useShopSponsors(shopId)
+  const { rows: sponsorRows, setRows: setSponsorRows } = sponsorsState
 
   const amt = Number(amount)
   const eligible = eligibleVouchers(amt)
@@ -369,22 +500,18 @@ function IssueForm({
   // A row left completely empty is ignored; a half-filled row needs both image and name.
   const filledSponsors = sponsorRows.filter((s) => s.image || s.name.trim())
   const sponsorsIncomplete = filledSponsors.some((s) => !s.image || !s.name.trim())
-  const sponsors: Sponsor[] = useMemo(
+  const previewSponsors: Sponsor[] = useMemo(
     () =>
       sponsorRows
         .filter((s) => s.image && s.name.trim())
-        .map((s) => ({ id: sponsorId(s.name.trim(), s.image), name: s.name.trim(), image: s.image })),
+        .map((s) => ({ id: s.key, name: s.name.trim(), image: s.image })),
     [sponsorRows],
   )
 
-  // Remember complete sponsors so staff don't re-upload images for every customer or after a reload.
-  const sponsorKey = sponsors.map((s) => s.id).join()
-  useEffect(() => setActiveSponsors(sponsors), [sponsorKey])
-
   const previewCount = eligible ? Math.min(Math.max(count, 0), eligible) : 0
   useEffect(
-    () => onDraft({ customerName: name.trim(), shopId, sponsors, count: previewCount }),
-    [name, shopId, sponsors, previewCount, onDraft],
+    () => onDraft({ customerName: name.trim(), shopId, sponsors: previewSponsors, count: previewCount }),
+    [name, shopId, previewSponsors, previewCount, onDraft],
   )
 
   const errors = {
@@ -399,21 +526,19 @@ function IssueForm({
   const updateSponsor = (key: string, patch: Partial<SponsorRow>) =>
     setSponsorRows((list) => list.map((s) => (s.key === key ? { ...s, ...patch } : s)))
 
-  const submit = (e: FormEvent) => {
+  const submit = async (e: FormEvent) => {
     e.preventDefault()
     setTried(true)
-    if (Object.values(errors).some(Boolean)) return
-    onIssue(
-      {
-        phone: normalised!,
-        customerName: name.trim(),
-        place: place.trim() || '—',
-        shopId,
-        billNo: billNo.trim(),
-        ...(sponsors.length ? { sponsorIds: rememberSponsors(sponsors) } : {}),
-      },
-      count,
+    setFormError('')
+    if (busy || Object.values(errors).some(Boolean)) return
+    setBusy(true)
+    // The server puts the shop's saved sponsors on the voucher, so save any edits first.
+    const error = await onIssue(
+      { shopId, customerName: name.trim(), phone: normalised!, place: place.trim(), billNo: billNo.trim(), count },
+      sponsorsState.flush,
     )
+    setBusy(false)
+    if (error) return setFormError(error)
     // Keep the shop and sponsors: the counter usually issues several in a row with the same ones.
     setPhone('')
     setName('')
@@ -485,26 +610,37 @@ function IssueForm({
         </FormSection>
 
         <FormSection step={2} title="Purchase">
-          <Field label="Shop" error={err('shop')}>
-            <select
-              value={shopId}
-              onChange={(e) => setShopId(e.target.value)}
-              aria-invalid={Boolean(err('shop'))}
-              className={`${inputCls} cursor-pointer`}
-            >
-              <option value="">Select shop number…</option>
-              {shopRows.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.shopNo} · {s.name} — {s.categoryLabel}
-                </option>
-              ))}
-            </select>
-            {shop && (
-              <p className="mt-1.5 flex items-center gap-1.5 text-xs text-muted">
-                <Store className="size-3.5" aria-hidden /> {shop.location} · {shop.owner}
+          {admin ? (
+            <Field label="Shop" error={err('shop')}>
+              <select
+                value={shopId}
+                onChange={(e) => setShopId(e.target.value)}
+                aria-invalid={Boolean(err('shop'))}
+                className={`${inputCls} cursor-pointer`}
+              >
+                <option value="">Select shop number…</option>
+                {shopRows.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.shopNo} · {s.name} — {s.categoryLabel}
+                  </option>
+                ))}
+              </select>
+              {shop && (
+                <p className="mt-1.5 flex items-center gap-1.5 text-xs text-muted">
+                  <Store className="size-3.5" aria-hidden /> {shop.location} · {shop.owner}
+                </p>
+              )}
+            </Field>
+          ) : (
+            <div>
+              <p className="mb-1.5 text-sm font-semibold text-ink">Shop</p>
+              <p className="flex min-h-11 items-center gap-2 rounded-lg border border-line bg-sand px-3 text-ink">
+                <Store className="size-4 shrink-0 text-muted" aria-hidden />
+                <span className="font-semibold">{shop ? `${shop.shopNo} · ${shop.name}` : user.shopId}</span>
               </p>
-            )}
-          </Field>
+              {shop && <p className="mt-1.5 text-xs text-muted">{shop.location}</p>}
+            </div>
+          )}
 
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Bill amount (₹)" hint="Not saved" error={err('amount')}>
@@ -549,28 +685,45 @@ function IssueForm({
           </Field>
         </FormSection>
 
-        <FormSection step={3} title="Sponsors" aside="Optional · kept for the next customer">
-          <ul className="space-y-2.5">
-            {sponsorRows.map((s, i) => (
-              <SponsorInput
-                key={s.key}
-                sponsor={s}
-                index={i}
-                invalid={tried && Boolean(s.image) !== Boolean(s.name.trim())}
-                onChange={(patch) => updateSponsor(s.key, patch)}
-                onRemove={() =>
-                  setSponsorRows((list) => (list.length > 1 ? list.filter((x) => x.key !== s.key) : [sponsorRow()]))
-                }
-              />
-            ))}
-          </ul>
-          <button
-            type="button"
-            onClick={() => setSponsorRows((list) => [...list, sponsorRow()])}
-            className="inline-flex min-h-11 w-full items-center justify-center gap-1.5 rounded-xl border border-dashed border-line px-3 text-sm font-bold text-ink transition-colors hover:border-gold hover:bg-gold-soft/40"
-          >
-            <Plus className="size-4" aria-hidden /> Add sponsor
-          </button>
+        <FormSection step={3} title="Sponsors" aside={admin ? 'Optional · for the selected shop' : "Optional · your shop's own"}>
+          {!shopId ? (
+            <p className="rounded-lg bg-sand px-3 py-2 text-sm text-muted">Pick the shop first to see its sponsors.</p>
+          ) : sponsorsState.status === 'loading' ? (
+            <p className="rounded-lg bg-sand px-3 py-2 text-sm text-muted">Loading sponsors…</p>
+          ) : (
+            <>
+              <ul className="space-y-2.5">
+                {sponsorRows.map((s, i) => (
+                  <SponsorInput
+                    key={s.key}
+                    sponsor={s}
+                    index={i}
+                    invalid={tried && Boolean(s.image) !== Boolean(s.name.trim())}
+                    onChange={(patch) => updateSponsor(s.key, patch)}
+                    onRemove={() =>
+                      setSponsorRows((list) => (list.length > 1 ? list.filter((x) => x.key !== s.key) : [sponsorRow()]))
+                    }
+                  />
+                ))}
+              </ul>
+              <button
+                type="button"
+                onClick={() => setSponsorRows((list) => [...list, sponsorRow()])}
+                className="inline-flex min-h-11 w-full items-center justify-center gap-1.5 rounded-xl border border-dashed border-line px-3 text-sm font-bold text-ink transition-colors hover:border-gold hover:bg-gold-soft/40"
+              >
+                <Plus className="size-4" aria-hidden /> Add sponsor
+              </button>
+              <p aria-live="polite" className={`text-xs ${sponsorsState.status === 'error' ? 'font-semibold text-crimson' : 'text-muted'}`}>
+                {sponsorsState.status === 'saving'
+                  ? 'Saving sponsors…'
+                  : sponsorsState.status === 'error'
+                    ? sponsorsState.error
+                    : sponsorsState.status === 'saved'
+                      ? 'Sponsors saved. They go on every coupon from this shop.'
+                      : 'Saved automatically. They go on every coupon from this shop.'}
+              </p>
+            </>
+          )}
           {err('sponsors') && (
             <p role="alert" className="text-xs font-semibold text-crimson">
               {err('sponsors')}
@@ -600,16 +753,94 @@ function IssueForm({
             ))}
           </div>
         </div>
+        {formError && (
+          <p role="alert" className="rounded-lg bg-crimson-soft px-3 py-2 text-sm font-semibold text-crimson">
+            {formError}
+          </p>
+        )}
         <button
           type="submit"
-          className="inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-whatsapp px-4 py-3 font-bold text-white shadow-lift transition-[background-color,transform] duration-150 hover:bg-whatsapp-hover active:scale-[0.99]"
+          disabled={busy}
+          className="inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-whatsapp px-4 py-3 font-bold text-white shadow-lift transition-[background-color,transform] duration-150 hover:bg-whatsapp-hover active:scale-[0.99] disabled:opacity-60"
         >
           <WhatsAppIcon className="size-5" />
-          Generate {count > 0 && eligible > 0 ? `${count} ` : ''}voucher{count === 1 ? '' : 's'} & open WhatsApp
+          {busy
+            ? 'Saving vouchers…'
+            : `Generate ${count > 0 && eligible > 0 ? `${count} ` : ''}voucher${count === 1 ? '' : 's'} & open WhatsApp`}
         </button>
       </div>
     </form>
   )
+}
+
+type SponsorsStatus = 'idle' | 'loading' | 'saving' | 'saved' | 'error'
+const sponsorsKey = (list: { name: string; image: string }[]) => list.map((s) => `${s.name}\n${s.image}`).join('\n\n')
+
+/**
+ * The selected shop's sponsors, loaded from the server and saved back automatically
+ * (a moment after each change). `flush` saves straight away, before a voucher is issued.
+ */
+function useShopSponsors(shopId: string) {
+  const [rows, setRows] = useState<SponsorRow[]>(() => [sponsorRow()])
+  const [status, setStatus] = useState<SponsorsStatus>('idle')
+  const [error, setError] = useState('')
+  const loadedFor = useRef<string | null>(null)
+  const savedKey = useRef('')
+
+  useEffect(() => {
+    loadedFor.current = null
+    setRows([sponsorRow()])
+    if (!shopId) return setStatus('idle')
+    let stale = false
+    setStatus('loading')
+    getSponsors(shopId)
+      .then((list) => {
+        if (stale) return
+        setRows(list.length ? list.map(sponsorRow) : [sponsorRow()])
+        savedKey.current = sponsorsKey(list)
+        loadedFor.current = shopId
+        setStatus('idle')
+      })
+      .catch((err) => {
+        if (stale) return
+        setStatus('error')
+        setError(errorText(err, 'Could not load the sponsors'))
+      })
+    return () => {
+      stale = true
+    }
+  }, [shopId])
+
+  const complete = rows.filter((r) => r.image && r.name.trim()).map((r) => ({ name: r.name.trim(), image: r.image }))
+  const key = sponsorsKey(complete)
+  const latest = useRef(complete)
+  latest.current = complete
+
+  const flush = useCallback(async () => {
+    if (!shopId || loadedFor.current !== shopId) return
+    const list = latest.current
+    const k = sponsorsKey(list)
+    if (k === savedKey.current) return
+    setStatus('saving')
+    try {
+      await saveSponsors(shopId, list)
+      savedKey.current = k
+      setStatus('saved')
+      setError('')
+    } catch (err) {
+      setStatus('error')
+      setError(errorText(err, 'Could not save the sponsors'))
+      throw err
+    }
+  }, [shopId])
+
+  useEffect(() => {
+    if (loadedFor.current !== shopId || key === savedKey.current) return
+    const t = setTimeout(() => void flush().catch(() => {}), 800)
+    return () => clearTimeout(t)
+  }, [key, shopId, flush])
+
+  return { rows, setRows, status, error, flush }
 }
 
 function FormSection({
@@ -649,7 +880,11 @@ interface SponsorRow extends Omit<Sponsor, 'id'> {
 }
 
 let sponsorSeq = 0
-const sponsorRow = (s?: Sponsor): SponsorRow => ({ name: s?.name ?? '', image: s?.image ?? '', key: `s-${++sponsorSeq}` })
+const sponsorRow = (s?: { name: string; image: string }): SponsorRow => ({
+  name: s?.name ?? '',
+  image: s?.image ?? '',
+  key: `s-${++sponsorSeq}`,
+})
 
 function SponsorInput({
   sponsor,
@@ -853,7 +1088,7 @@ function LastIssued({
   issue: Issue
   /** How the coupon image went out on the last send; null before any send. */
   sendResult: SendResult | null
-  onSend: (i: Issue) => void
+  onSend: (i: Issue) => Promise<void>
   onDone: () => void
 }) {
   const [note, setNote] = useState('')
@@ -928,13 +1163,9 @@ function LastIssued({
         <p role="status" className="mt-1 text-sm text-ink/80">
           {issue.status === 'pending'
             ? 'The browser blocked the WhatsApp tab. Allow pop-ups for this page, then press “Open WhatsApp chat”.'
-            : sendResult === 'linked'
-              ? 'The chat is open with the greeting and a link to download the coupon image. Press Send in WhatsApp.'
-              : sendResult === 'upload-failed'
-                ? 'The coupon could not be uploaded, so the chat opened without the download link. Check the internet and press “Open WhatsApp chat” to try again, or attach the image yourself.'
-                : sendResult === 'copied'
-                  ? 'The coupon image is copied. In the WhatsApp chat press Ctrl+V to paste it, then send it with the greeting.'
-                  : 'The chat is open with the greeting typed. Download or share the coupon image and attach it to the chat.'}
+            : sendResult === 'upload-failed'
+              ? 'The coupon could not be uploaded, so the chat opened without the download link. Check the internet and press “Open WhatsApp chat” to try again, or attach the image yourself.'
+              : 'The chat is open with the greeting and a link to download the coupon image. Press Send in WhatsApp.'}
         </p>
         {issue.couponUrl && (
           <p className="mt-2 flex min-w-0 items-center gap-1.5 text-xs text-ink/80">
@@ -947,7 +1178,7 @@ function LastIssued({
         <div className="mt-3 flex flex-wrap gap-2">
           <button
             type="button"
-            onClick={() => onSend(issue)}
+            onClick={() => void onSend(issue)}
             className="inline-flex min-h-11 items-center gap-1.5 rounded-lg bg-whatsapp px-3 text-sm font-bold text-white transition-colors hover:bg-whatsapp-hover"
           >
             <ExternalLink className="size-4" aria-hidden /> Open WhatsApp chat
@@ -988,9 +1219,7 @@ function LastIssued({
           {busy ? 'Preparing the image…' : note}
         </p>
         <p className="text-xs text-muted">
-          {couponLinksEnabled
-            ? 'The customer taps the link in the message to download the coupon image to their phone.'
-            : 'Download links are off until the coupon server is set up (see .env.example). Meanwhile, paste or attach the image.'}
+          The customer taps the link in the message to download the coupon image to their phone.
         </p>
       </div>
 

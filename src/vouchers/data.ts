@@ -1,4 +1,3 @@
-import { useEffect, useMemo, useState } from 'react'
 import { categories, shops, type Shop } from '../data/shops'
 import { festival } from '../data/festival'
 
@@ -73,6 +72,8 @@ export interface Issue {
   sponsorIds?: string[]
   /** Public link that downloads the coupon image, once it has been uploaded. */
   couponUrl?: string
+  /** Login that issued it (a shop, or the mall admin). */
+  issuedBy?: string
 }
 
 /**
@@ -96,180 +97,18 @@ export async function sponsorImage(file: File, maxW = 360, maxH = 270): Promise<
   return canvas.toDataURL('image/jpeg', 0.85)
 }
 
-export function sponsorId(name: string, image: string) {
-  let h = 5381
-  const s = `${name}\n${image}`
-  for (let i = 0; i < s.length; i++) h = (Math.imul(h, 33) ^ s.charCodeAt(i)) >>> 0
-  return `sp-${h.toString(36)}-${s.length.toString(36)}`
+// ---------- sponsors seen on vouchers ----------
+// The server sends each voucher's sponsors (logo + name) alongside the vouchers; this cache lets
+// any coupon or message look them up by id.
+
+const sponsorCache = new Map<string, Sponsor>()
+
+export function cacheSponsors(sponsors: Record<string, Sponsor>) {
+  for (const s of Object.values(sponsors)) sponsorCache.set(s.id, s)
 }
-
-// ---------- sponsors ----------
-// The library holds every sponsor version ever put on a voucher, so old vouchers can still show theirs.
-// The active list is what the form starts with: the same sponsors usually go on every coupon.
-
-const LIBRARY_KEY = 'dme-voucher-sponsor-library-v1'
-const ACTIVE_KEY = 'dme-voucher-sponsors-v2'
-
-function readJson<T>(key: string, fallback: T): T {
-  try {
-    const raw = localStorage.getItem(key)
-    if (raw) return JSON.parse(raw) as T
-  } catch {
-    // storage blocked or corrupt
-  }
-  return fallback
-}
-
-function writeJson(key: string, value: unknown) {
-  try {
-    localStorage.setItem(key, JSON.stringify(value))
-  } catch {
-    // storage blocked or full — still works in memory for this session
-  }
-}
-
-let library: Record<string, Sponsor> | null = null
-const getLibrary = () => (library ??= readJson<Record<string, Sponsor>>(LIBRARY_KEY, {}))
 
 export const sponsorsFor = (issue: Issue): Sponsor[] =>
-  (issue.sponsorIds ?? []).map((id) => getLibrary()[id]).filter(Boolean)
-
-export const loadActiveSponsors = (): Sponsor[] => readJson<Sponsor[]>(ACTIVE_KEY, [])
-
-/** Overwrites the form's saved sponsor list (no history kept — that's what the library is for). */
-export const setActiveSponsors = (sponsors: Sponsor[]) => writeJson(ACTIVE_KEY, sponsors)
-
-/** Adds sponsors to the library when they go on a voucher, and returns their ids for the issue. */
-export function rememberSponsors(sponsors: Sponsor[]) {
-  const lib = getLibrary()
-  if (sponsors.some((s) => !lib[s.id])) {
-    for (const s of sponsors) lib[s.id] = s
-    writeJson(LIBRARY_KEY, lib)
-  }
-  return sponsors.map((s) => s.id)
-}
-
-const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-
-export function makeCode(taken: Set<string>, rand: () => number = Math.random) {
-  for (;;) {
-    let body = ''
-    for (let i = 0; i < 6; i++) body += CODE_CHARS[Math.floor(rand() * CODE_CHARS.length)]
-    const code = `DME-${body}`
-    if (!taken.has(code)) {
-      taken.add(code)
-      return code
-    }
-  }
-}
-
-export const allCodes = (issues: Issue[]) => new Set(issues.flatMap((i) => i.codes))
-
-// ---------- mock seed ----------
-
-function mulberry32(seed: number) {
-  return () => {
-    seed |= 0
-    seed = (seed + 0x6d2b79f5) | 0
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
-
-const firstNames = [
-  'Aysha', 'Fathima', 'Muhammed', 'Arjun', 'Anjali', 'Shamna', 'Rahul', 'Nihal', 'Sreelakshmi', 'Jaseela',
-  'Abdul Rasheed', 'Neethu', 'Vishnu', 'Hiba', 'Joseph', 'Sneha', 'Faisal', 'Divya', 'Ameen', 'Reshma',
-  'Thomas', 'Safa', 'Akhil', 'Mariya', 'Shahid', 'Lakshmi', 'Irfan', 'Gopika', 'Basil', 'Nasrin',
-]
-const initialsPool = ['K', 'P', 'M', 'T', 'V', 'C', 'E', 'A']
-
-// Typical bill sizes per category, in rupees.
-const spend: Record<string, [number, number]> = {
-  jewellery: [6000, 85000],
-  fashion: [800, 9000],
-  beauty: [500, 6000],
-  mobiles: [2500, 42000],
-  daily: [350, 5500],
-  gifts: [600, 12000],
-  services: [1000, 15000],
-}
-
-function seedIssues(): Issue[] {
-  const rand = mulberry32(2026)
-  const pick = <T,>(list: readonly T[]) => list[Math.floor(rand() * list.length)]
-  const taken = new Set<string>()
-  const now = Date.now()
-  const issues: Issue[] = []
-
-  for (let n = 0; n < 72; n++) {
-    const shop = pick(shopRows)
-    const [lo, hi] = spend[shop.category]
-    // Skew towards smaller bills, rounded to ₹10.
-    const amount = Math.round((lo + (hi - lo) * rand() ** 2) / 10) * 10
-    const eligible = eligibleVouchers(amount)
-    if (eligible === 0) continue
-    const count = rand() < 0.85 ? eligible : Math.max(1, eligible - 1 - Math.floor(rand() * 2))
-    const createdAt = new Date(now - Math.floor(rand() * 14 * 24 * 60) * 60_000)
-    const status: IssueStatus = rand() < 0.86 ? 'sent' : 'pending'
-    issues.push({
-      id: `iss-${n + 1}`,
-      createdAt: createdAt.toISOString(),
-      shopId: shop.id,
-      customerName: `${pick(firstNames)} ${pick(initialsPool)}`,
-      // MOCK numbers in a dummy range — swap for real customers before sending.
-      phone: `90000${String(10000 + Math.floor(rand() * 89999)).slice(0, 5)}`,
-      place: pick(places),
-      billNo: `${shop.shopNo.replace('-', '')}/${String(1200 + n * 7 + Math.floor(rand() * 6))}`,
-      codes: Array.from({ length: count }, () => makeCode(taken, rand)),
-      status,
-      sentAt: status === 'sent' ? new Date(createdAt.getTime() + 60_000).toISOString() : undefined,
-    })
-  }
-  return issues.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-}
-
-// ---------- store (localStorage, mock backend) ----------
-
-const STORAGE_KEY = 'dme-voucher-desk-v1'
-
-function load(): Issue[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) return JSON.parse(raw) as Issue[]
-  } catch {
-    // storage blocked or corrupt — fall back to seed
-  }
-  return seedIssues()
-}
-
-export function useIssues() {
-  const [issues, setIssues] = useState<Issue[]>(load)
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(issues))
-    } catch {
-      // ignore — demo still works in memory
-    }
-  }, [issues])
-
-  const actions = useMemo(
-    () => ({
-      add: (issue: Issue) => setIssues((list) => [issue, ...list]),
-      markSent: (id: string) =>
-        setIssues((list) =>
-          list.map((i) => (i.id === id ? { ...i, status: 'sent' as const, sentAt: new Date().toISOString() } : i)),
-        ),
-      setCouponUrl: (id: string, couponUrl: string) =>
-        setIssues((list) => list.map((i) => (i.id === id ? { ...i, couponUrl } : i))),
-      reset: () => setIssues(seedIssues()),
-    }),
-    [],
-  )
-
-  return { issues, ...actions }
-}
+  (issue.sponsorIds ?? []).map((id) => sponsorCache.get(id)).filter((s): s is Sponsor => Boolean(s))
 
 // ---------- WhatsApp ----------
 

@@ -1,10 +1,8 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
-  /** Coupon server address, e.g. http://localhost:8787 — enables coupon download links. */
+  /** Voucher desk server address for local development, e.g. http://localhost:8787. */
   readonly VITE_COUPON_API_URL?: string
-  /** Must match DESK_KEY in server/.env; lets this desk upload coupons. */
-  readonly VITE_COUPON_API_KEY?: string
 }
 
 interface ImportMeta {
