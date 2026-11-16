@@ -79,7 +79,7 @@ own() { if [ "$IS_ROOT" -eq 1 ]; then chown -R "$CP_USER:$CP_USER" "$@"; fi; }
 HAVE_UAPI=0
 command -v uapi >/dev/null && HAVE_UAPI=1
 api() { uapi --output=json --user="$CP_USER" "$@" 2>&1 || true; }
-api_ok() { grep -Eq '"status": *1'; }
+api_ok() { local in; in="$(cat)"; grep -Eq '"status": *1' <<<"$in"; }
 json_str() { sed -n "s/.*\"$1\": *\"\\([^\"]*\\)\".*/\\1/p" | head -n 1 | sed 's#\\/#/#g'; }
 api_errors() { grep -o '"errors": *\[[^]]*\]' | head -n 1 | sed 's/"errors": *//'; }
 domain_info() { api DomainInfo single_domain_data domain="$1"; }
@@ -248,7 +248,7 @@ elif command -v cloudlinux-selector >/dev/null; then
   # CloudLinux "Setup Node.js App"
   MAJOR="${NODE_MAJOR:-$(newest_major /opt/alt/alt-nodejs*)}"
   APPS="$(cloudlinux-selector get --json --interpreter nodejs --user "$CP_USER" 2>&1 || true)"
-  if printf '%s' "$APPS" | grep -q "\"$APP_DIR_NAME\""; then
+  if grep -q "\"$APP_DIR_NAME\"" <<<"$APPS"; then
     cloudlinux-selector restart --json --interpreter nodejs --user "$CP_USER" --app-root "$APP_DIR_NAME" >/dev/null 2>&1 &&
       ok "Node.js app already set up; restarted it" || warn "Could not restart the Node.js app; restart it in cPanel → Setup Node.js App."
   elif [ -z "$MAJOR" ]; then
@@ -256,7 +256,7 @@ elif command -v cloudlinux-selector >/dev/null; then
   else
     OUT="$(cloudlinux-selector create --json --interpreter nodejs --user "$CP_USER" --app-root "$APP_DIR_NAME" \
       --domain "$COUPONS_HOST" --app-uri / --version "$MAJOR" --app-mode production --startup-file app.js 2>&1 || true)"
-    if printf '%s' "$OUT" | grep -Eq '"result": *"success"'; then
+    if grep -Eq '"result": *"success"' <<<"$OUT"; then
       cloudlinux-selector start --json --interpreter nodejs --user "$CP_USER" --app-root "$APP_DIR_NAME" >/dev/null 2>&1 || true
       ok "Created and started the Node.js app (Node $MAJOR, CloudLinux)"
     else
@@ -267,16 +267,20 @@ else
   # cPanel "Application Manager" (Phusion Passenger, EasyApache 4)
   MAJOR="${NODE_MAJOR:-$(newest_major /opt/cpanel/ea-nodejs*)}"
   HAVE_PASSENGER=0
-  if ls -d /opt/cpanel/ea-ruby*/root/usr/share/passenger >/dev/null 2>&1 || rpm -qa 2>/dev/null | grep -q mod_passenger; then
+  # Read the package lists into a variable first: with pipefail, `dpkg -l | grep -q` fails when
+  # grep stops early and dpkg gets SIGPIPE. (rpm on AlmaLinux/Rocky, dpkg on Ubuntu.)
+  PKGS="$( { rpm -qa 2>/dev/null || true; dpkg -l 2>/dev/null || true; } )"
+  if ls -d /opt/cpanel/ea-ruby*/root/usr/share/passenger >/dev/null 2>&1 || grep -Eq 'mod[_-]passenger' <<<"$PKGS"; then
     HAVE_PASSENGER=1
   fi
   if [ -z "$MAJOR" ] || [ "$HAVE_PASSENGER" -eq 0 ]; then
     warn "Node.js / Passenger isn't installed. Install it, then run this again:"
-    info "  dnf install -y ea-nodejs22 ea-ruby27-mod_passenger ea-apache24-mod_env   (use yum on CentOS 7)"
+    info "  AlmaLinux/Rocky: dnf install -y ea-nodejs22 ea-apache24-mod-passenger ea-apache24-mod_env"
+    info "  Ubuntu:          apt-get install -y ea-nodejs22 ea-apache24-mod-passenger ea-apache24-mod-env"
     info "  and in WHM → Feature Manager, allow \"Application Manager\" for the account's package."
   else
     APPS="$(api PassengerApps list_applications)"
-    if printf '%s' "$APPS" | grep -q "\"$APP_DIR_NAME\""; then
+    if grep -q "\"$APP_DIR_NAME\"" <<<"$APPS"; then
       ok "Node.js app already registered; it restarts on the next visit"
     else
       OUT="$(api PassengerApps register_application name="$APP_DIR_NAME" path="$APP_DIR_NAME" domain="$COUPONS_HOST" \
@@ -328,10 +332,10 @@ elif command -v curl >/dev/null; then
   HEALTH=""
   for _ in 1 2 3 4 5; do
     HEALTH="$(curl -s -m 15 -H "Host: $COUPONS_HOST" http://127.0.0.1/healthz || true)"
-    printf '%s' "$HEALTH" | grep -q '"ok":true' && break
+    grep -q '"ok":true' <<<"$HEALTH" && break
     sleep 3
   done
-  if printf '%s' "$HEALTH" | grep -q '"ok":true'; then
+  if grep -q '"ok":true' <<<"$HEALTH"; then
     ok "Coupon server is answering at $COUPONS_HOST"
   else
     warn "Coupon server didn't answer yet. Check the log: $APP/stderr.log or cPanel → Setup Node.js App."

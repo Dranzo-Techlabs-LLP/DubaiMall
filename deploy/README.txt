@@ -26,9 +26,12 @@ STEP 1: GET THE PACKAGE ONTO THE SERVER
 STEP 2: (ONLY IF NEEDED) INSTALL NODE.JS
   deploy.sh tells you if Node.js is missing. To install it from the terminal:
     CloudLinux servers:   WHM → LVE Manager → Node.js Selector → install Node.js 22
-    Other cPanel servers: dnf install -y ea-nodejs22 ea-ruby27-mod_passenger ea-apache24-mod_env
-                          (yum instead of dnf on CentOS 7), and in WHM → Feature Manager
-                          allow "Application Manager" for the account's package.
+    Other cPanel servers, as root:
+      AlmaLinux/Rocky: dnf install -y ea-nodejs22 ea-apache24-mod-passenger ea-apache24-mod_env
+      Ubuntu:          apt-get install -y ea-nodejs22 ea-apache24-mod-passenger ea-apache24-mod-env
+      (older cPanel: ea-ruby27-mod_passenger instead of ea-apache24-mod-passenger)
+    Then in WHM → Feature Manager, allow "Application Manager" (passengerapps)
+    for the account's feature list.
 
 
 STEP 3: DEPLOY
