@@ -28,9 +28,12 @@ import { WhatsAppIcon } from '../components/ShopCard'
 import { festival } from '../data/festival'
 import {
   apiConfigured,
+  can,
   createIssue,
+  dismissEntry,
   getSponsors,
   hasSession,
+  listEntries,
   listIssues,
   logout,
   markSent,
@@ -38,6 +41,7 @@ import {
   onSessionExpired,
   saveSponsors,
   uploadCoupon,
+  type Entry,
   type NewIssue,
   type User,
 } from './api'
@@ -59,8 +63,10 @@ import {
 } from './data'
 import { PurchaseGrid, ShopGrid, VoucherGrid } from './grids'
 import { Login } from './Login'
+import { QrEntries } from './QrEntries'
 import { canShareImage, copyImage, couponFileName, downloadImage, nodeToPng, shareImage } from './share'
 import { ShopLogins } from './ShopLogins'
+import { ShopQr } from './ShopQr'
 
 /** What the form currently holds — drives the live coupon preview. */
 interface Draft {
@@ -76,7 +82,7 @@ const shopLabel = (shopId: string) => {
   return s ? `${s.shopNo} · ${s.name}` : ''
 }
 
-type Tab = 'vouchers' | 'purchases' | 'shops' | 'logins'
+type Tab = 'vouchers' | 'purchases' | 'qr' | 'shops' | 'logins'
 
 /** Accepts "98470 12345", "+91 9847012345", "09847012345" … returns the 10-digit mobile or null. */
 function normalisePhone(raw: string) {
@@ -202,10 +208,37 @@ function useIssues() {
   return { issues: issues ?? [], error, reload, upsert }
 }
 
+/** Customers waiting from the QR form, checked again every 15 seconds while the desk is open. */
+function useEntries(enabled: boolean) {
+  const [entries, setEntries] = useState<Entry[]>([])
+  const [error, setError] = useState('')
+  const reload = useCallback(async () => {
+    if (!enabled) return
+    try {
+      setEntries(await listEntries())
+      setError('')
+    } catch (err) {
+      setError(errorText(err, 'Could not load the QR customers'))
+    }
+  }, [enabled])
+  useEffect(() => {
+    void reload()
+    if (!enabled) return
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') void reload()
+    }, 15_000)
+    return () => clearInterval(t)
+  }, [enabled, reload])
+  return { entries, error, reload }
+}
+
 function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
   const admin = user.role === 'admin'
   const myShop = user.shopId ? shopById[user.shopId] : undefined
   const { issues, error: loadError, reload, upsert } = useIssues()
+  const canIssue = can(user, 'issue')
+  const canQr = can(user, 'qr')
+  const { entries, error: entriesError, reload: reloadEntries } = useEntries(canQr)
   const [target, setTarget] = useState<WhatsAppTarget>('web')
   const [last, setLast] = useState<Issue | null>(null)
   const [sendResult, setSendResult] = useState<SendResult | null>(null)
@@ -279,9 +312,20 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
     }
   }
 
+  /** Vouchers for a customer from the QR form: their details come from the entry. Call straight from the click. */
+  const release = async (entry: Entry, count: number) => {
+    const error = await issue(
+      { shopId: entry.shopId, customerName: entry.customerName, phone: entry.phone, place: entry.place, billNo: entry.billNo, count, entryId: entry.id },
+      async () => {},
+    )
+    void reloadEntries()
+    return error
+  }
+
   const tabs: { id: Tab; label: string; count?: number }[] = [
     { id: 'vouchers', label: 'Vouchers', count: stats.vouchers },
     { id: 'purchases', label: 'Customers', count: stats.purchases },
+    ...(canQr ? [{ id: 'qr' as const, label: admin ? 'QR codes' : 'My QR & code' }] : []),
     ...(admin
       ? [
           { id: 'shops' as const, label: 'Shop-wise', count: shopRows.length },
@@ -354,8 +398,33 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
           />
         </section>
 
+        {canQr && (
+          <QrEntries
+            user={user}
+            entries={entries}
+            error={entriesError}
+            onRelease={release}
+            onDismiss={async (e) => {
+              try {
+                await dismissEntry(e.id)
+              } finally {
+                void reloadEntries()
+              }
+            }}
+          />
+        )}
+
         <div className="grid items-start gap-6 lg:grid-cols-[440px_1fr]">
-          <IssueForm user={user} target={target} onTarget={setTarget} onIssue={issue} onDraft={setDraft} />
+          {canIssue ? (
+            <IssueForm user={user} target={target} onTarget={setTarget} onIssue={issue} onDraft={setDraft} />
+          ) : (
+            <div className="rounded-2xl border border-line bg-white p-6 shadow-card">
+              <h2 className="text-xl font-semibold text-ink">Issuing is switched off</h2>
+              <p className="mt-1 text-sm text-muted">
+                This login can see its vouchers but can't issue new ones. Ask the mall office to switch “Issue” back on.
+              </p>
+            </div>
+          )}
           {/* Only the short preview sticks; the issued list can be taller than the screen. */}
           <div className={last ? undefined : 'lg:sticky lg:top-6'}>
             {last ? (
@@ -384,7 +453,7 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
                 </button>
               ))}
             </div>
-            {tab !== 'logins' && (
+            {tab !== 'logins' && tab !== 'qr' && (
               <div className="flex flex-1 items-center justify-end gap-2">
                 <label className="relative w-full max-w-xs">
                   <span className="sr-only">Search records</span>
@@ -415,13 +484,16 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
             )}
           </div>
 
-          {tab === 'vouchers' && <VoucherGrid issues={issues} search={search} onReady={(api) => (gridApi.current = api)} />}
+          {tab === 'vouchers' && (
+            <VoucherGrid issues={issues} search={search} onReady={(api) => (gridApi.current = api)} onSend={(i) => void send(i)} />
+          )}
           {tab === 'purchases' && (
             <PurchaseGrid issues={issues} search={search} onReady={(api) => (gridApi.current = api)} onSend={(i) => void send(i)} />
           )}
           {tab === 'shops' && admin && (
             <ShopGrid issues={issues} search={search} onReady={(api) => (gridApi.current = api)} />
           )}
+          {tab === 'qr' && canQr && <ShopQr user={user} />}
           {tab === 'logins' && admin && <ShopLogins me={user} />}
         </section>
       </main>
@@ -685,6 +757,7 @@ function IssueForm({
           </Field>
         </FormSection>
 
+        {can(user, 'sponsors') && (
         <FormSection step={3} title="Sponsors" aside={admin ? 'Optional · for the selected shop' : "Optional · your shop's own"}>
           {!shopId ? (
             <p className="rounded-lg bg-sand px-3 py-2 text-sm text-muted">Pick the shop first to see its sponsors.</p>
@@ -730,6 +803,7 @@ function IssueForm({
             </p>
           )}
         </FormSection>
+        )}
       </div>
 
       <div className="space-y-3 rounded-b-2xl border-t border-line bg-ivory px-5 py-4 sm:px-6">

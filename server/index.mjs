@@ -1,6 +1,8 @@
 // Coupon link server for the Dubai Mall Edakkara voucher desk.
 //
-// Also the voucher desk's backend: shop and admin logins, every shop's vouchers and sponsors.
+// Also the voucher desk's backend: shop and admin logins, every shop's vouchers and sponsors,
+// and each shop's QR customer form (/s/<shop>): customers type their details on their own phone,
+// shop staff confirm with the shop's counter code, and the entry waits in the desk for vouchers.
 // The desk uploads each coupon image here; the server stores it and returns a short
 // link (/c/<id>) for the WhatsApp greeting. The link opens a page with the coupon and a Download
 // button, and carries Open Graph tags so WhatsApp can show the coupon as a link preview.
@@ -96,7 +98,7 @@ function sqliteStore(DatabaseSync) {
   `)
   db.exec(`
     create table if not exists docs (
-      col   text not null,                     -- users, sessions, issues, sponsors, sponsorLib
+      col   text not null,                     -- users, sessions, issues, sponsors, sponsorLib, entries, shopSettings
       id    text not null,
       data  text not null,                     -- JSON
       primary key (col, id)
@@ -209,7 +211,7 @@ function corsHeaders(req) {
   if (!DESK_ORIGINS.includes(origin)) return {}
   return {
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '600',
     Vary: 'Origin',
@@ -263,7 +265,7 @@ const SHOP_ID = /^[a-z0-9][a-z0-9-]{1,39}$/
 const USERNAME = /^[a-z0-9][a-z0-9._-]{1,39}$/
 
 const docs = {}
-for (const col of ['users', 'sessions', 'issues', 'sponsors', 'sponsorLib']) {
+for (const col of ['users', 'sessions', 'issues', 'sponsors', 'sponsorLib', 'entries', 'shopSettings']) {
   docs[col] = new Map(store.docsLoad(col).map((d) => [d.id, d]))
 }
 function putDoc(col, doc) {
@@ -311,7 +313,7 @@ function sessionOf(req) {
   const session = docs.sessions.get(tokenId(m[1]))
   if (!session || session.expiresAt < new Date().toISOString()) return null
   const user = docs.users.get(session.userId)
-  return user ? { session, user } : null
+  return user && !user.disabled ? { session, user } : null
 }
 function endSessionsOf(userId, keepSessionId) {
   for (const s of [...docs.sessions.values()]) if (s.userId === userId && s.id !== keepSessionId) deleteDoc('sessions', s.id)
@@ -335,8 +337,35 @@ function noteFailure(key) {
   else f.count++
 }
 
-const publicUser = (u) => ({ username: u.id, role: u.role, shopId: u.shopId ?? null })
+// What a shop login may do; the admin sets these per shop. Missing = allowed.
+const RIGHTS = ['issue', 'sponsors', 'qr']
+const rightsOf = (u) => Object.fromEntries(RIGHTS.map((r) => [r, u.role === 'admin' || u.rights?.[r] !== false]))
+const can = (user, right) => rightsOf(user)[right]
+const noRight = { issue: 'issue vouchers', sponsors: 'change sponsors', qr: 'use the QR customer form' }
+const forbid = (right) => bad(`This login can't ${noRight[right]}. Ask the mall office.`, 403)
+
+const publicUser = (u) => ({ username: u.id, role: u.role, shopId: u.shopId ?? null, rights: rightsOf(u), disabled: Boolean(u.disabled) })
 const canSeeShop = (user, shopId) => user.role === 'admin' || user.shopId === shopId
+
+// --- QR customer form: each shop's counter code and form address ---
+const entryUrlFor = (shopId) => `${PUBLIC_URL}/s/${shopId}`
+const newCounterCode = () => String(randomBytes(4).readUInt32BE(0) % 1_000_000).padStart(6, '0')
+function shopSettings(shopId, label) {
+  const existing = docs.shopSettings.get(shopId)
+  if (existing && (!label || existing.label === label)) return existing
+  const settings = existing
+    ? { ...existing, label }
+    : { id: shopId, label: label || shopId, code: newCounterCode(), codeSetAt: new Date().toISOString() }
+  putDoc('shopSettings', settings)
+  return settings
+}
+const publicSettings = (s) => ({ shopId: s.id, label: s.label, code: s.code, codeSetAt: s.codeSetAt, entryUrl: entryUrlFor(s.id) })
+/** The shop's form accepts entries while its QR is set up and its login (if any) may use it. */
+function formOpen(shopId) {
+  const settings = docs.shopSettings.get(shopId)
+  const login = docs.users.get(shopId)
+  return Boolean(settings) && (!login || (!login.disabled && can(login, 'qr')))
+}
 
 // --- vouchers ---
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -402,6 +431,7 @@ async function api(req, url, reply) {
       return reply(401, { error: 'Wrong username or password' })
     }
     failures.delete(key)
+    if (user.disabled) return reply(403, { error: 'This login is switched off. Ask the mall office.' })
     putDoc('users', { ...user, lastLoginAt: new Date().toISOString() })
     return reply(200, { token: startSession(user), user: publicUser(user) })
   }
@@ -426,7 +456,13 @@ async function api(req, url, reply) {
   }
 
   if (method === 'POST' && path === '/api/issues') {
+    if (!can(user, 'issue')) throw forbid('issue')
     const body = await readJson(req)
+    // From a QR entry: the customer's own details come from the entry.
+    const entry = body.entryId ? docs.entries.get(String(body.entryId)) : undefined
+    if (body.entryId && (!entry || !canSeeShop(user, entry.shopId))) return reply(404, { error: 'Customer entry not found' })
+    if (entry && entry.status !== 'new') throw bad('Vouchers were already released for this customer')
+    if (entry) Object.assign(body, { shopId: entry.shopId, customerName: entry.customerName, phone: entry.phone, place: entry.place, billNo: entry.billNo })
     const shopId = admin ? text(body.shopId, 40, 'shop') : user.shopId
     if (!SHOP_ID.test(shopId)) throw bad('Invalid shop')
     const phone = String(body.phone ?? '')
@@ -446,9 +482,11 @@ async function api(req, url, reply) {
       codes: newCodes(count),
       status: 'pending',
       issuedBy: user.id,
+      ...(entry ? { entryId: entry.id } : {}),
       ...(sponsors.length ? { sponsorIds: sponsors.map((s) => s.id) } : {}),
     }
     putDoc('issues', issue)
+    if (entry) putDoc('entries', { ...entry, status: 'issued', issueId: issue.id, handledAt: issue.createdAt, handledBy: user.id })
     console.log(`voucher ${issue.id} · ${shopId} · ${count} code(s) by ${user.id}`)
     return reply(201, { issue, sponsors: sponsorsUsedBy([issue]) })
   }
@@ -468,6 +506,7 @@ async function api(req, url, reply) {
     const shopId = admin ? String((method === 'PUT' ? body.shopId : url.searchParams.get('shop')) ?? '') : user.shopId
     if (!SHOP_ID.test(shopId)) throw bad('Invalid shop')
     if (method === 'GET') return reply(200, { sponsors: docs.sponsors.get(shopId)?.list ?? [] })
+    if (!can(user, 'sponsors')) throw forbid('sponsors')
     const list = parseSponsors(body.sponsors)
     for (const s of list) if (!docs.sponsorLib.has(s.id)) putDoc('sponsorLib', s)
     putDoc('sponsors', { id: shopId, list, updatedAt: new Date().toISOString(), updatedBy: user.id })
@@ -480,12 +519,28 @@ async function api(req, url, reply) {
     const users = [...docs.users.values()].map((u) => ({
       ...publicUser(u),
       lastLoginAt: u.lastLoginAt ?? null,
+      createdAt: u.createdAt ?? null,
       passwordSetAt: u.passwordSetAt ?? null,
     }))
     return reply(200, { users })
   }
 
   const userRoute = /^\/api\/users\/([^/]+)$/.exec(path)
+  // Switch a shop login off/on, or change what it may do.
+  if (userRoute && method === 'PATCH') {
+    if (!admin) return reply(403, { error: 'Only the mall admin can manage logins' })
+    const existing = docs.users.get(decodeURIComponent(userRoute[1]).toLowerCase())
+    if (!existing) return reply(404, { error: 'No such login' })
+    if (existing.role === 'admin') throw bad('Admin logins always have every right')
+    const body = await readJson(req)
+    const rights = { ...rightsOf(existing) }
+    for (const r of RIGHTS) if (typeof body.rights?.[r] === 'boolean') rights[r] = body.rights[r]
+    const disabled = typeof body.disabled === 'boolean' ? body.disabled : Boolean(existing.disabled)
+    const updated = { ...existing, rights, disabled }
+    putDoc('users', updated)
+    if (disabled) endSessionsOf(existing.id)
+    return reply(200, { user: publicUser(updated) })
+  }
   if (userRoute && (method === 'PUT' || method === 'DELETE')) {
     if (!admin) return reply(403, { error: 'Only the mall admin can manage logins' })
     const username = decodeURIComponent(userRoute[1]).toLowerCase()
@@ -510,6 +565,37 @@ async function api(req, url, reply) {
     putDoc('users', updated)
     endSessionsOf(username, session.id) // a new password signs that login out everywhere else
     return reply(200, { user: publicUser(updated) })
+  }
+
+  // QR form settings: the shop's counter code and form address (created the first time).
+  if (method === 'POST' && (path === '/api/shop-settings' || path === '/api/shop-settings/new-code')) {
+    if (!can(user, 'qr')) throw forbid('qr')
+    const body = await readJson(req)
+    const shopId = admin ? String(body.shopId ?? '') : user.shopId
+    if (!SHOP_ID.test(shopId)) throw bad('Invalid shop')
+    let settings = shopSettings(shopId, text(body.label, 120, 'shop name', { optional: true }))
+    if (path.endsWith('/new-code')) {
+      settings = { ...settings, code: newCounterCode(), codeSetAt: new Date().toISOString() }
+      putDoc('shopSettings', settings)
+    }
+    return reply(200, { settings: publicSettings(settings) })
+  }
+
+  // Customers who filled in a shop's QR form: waiting ones, plus the last day's handled ones.
+  if (method === 'GET' && path === '/api/entries') {
+    if (!can(user, 'qr')) return reply(200, { entries: [] })
+    const since = new Date(Date.now() - 864e5).toISOString()
+    const entries = [...docs.entries.values()]
+      .filter((e) => canSeeShop(user, e.shopId) && (e.status === 'new' || (e.handledAt ?? '') > since))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    return reply(200, { entries })
+  }
+  const entryRoute = /^\/api\/entries\/([A-Za-z0-9_-]{1,80})$/.exec(path)
+  if (method === 'DELETE' && entryRoute) {
+    const entry = docs.entries.get(entryRoute[1])
+    if (!entry || !canSeeShop(user, entry.shopId)) return reply(404, { error: 'Customer entry not found' })
+    if (entry.status === 'new') putDoc('entries', { ...entry, status: 'dismissed', handledAt: new Date().toISOString(), handledBy: user.id })
+    return reply(200, { ok: true })
   }
 
   if (method === 'POST' && path === '/api/coupons') {
@@ -649,6 +735,148 @@ const notFoundPage = `<!doctype html><html lang="en"><head><meta charset="utf-8"
 <h1 style="font:600 24px Georgia,serif">Coupon not found</h1><p>Please check the link in your WhatsApp message, or ask at the Dubai Mall Edakkara counter.</p></body></html>`
 
 const PAGE_CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+const FORM_CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+
+// ---------- QR customer form (/s/<shop>) ----------
+
+const pageShell = (title, body) => `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#0E1838">
+<title>${escapeHtml(title)}</title>
+<style>
+  :root { --ink: #0e1838; --gold: #e9b949; --gold-text: #7a520c; --ivory: #faf7f2; --muted: #565d73; --line: #e3ddd2; --red: #b3261e; --green: #1f6e43; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--ivory); color: var(--ink); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { background: var(--ink); color: #fff; padding: 20px 16px 52px; text-align: center; }
+  .eyebrow { margin: 0; color: var(--gold); font-size: 12px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
+  h1 { margin: 6px auto 0; max-width: 520px; font: 600 clamp(22px, 6vw, 28px)/1.25 Georgia, "Times New Roman", serif; }
+  .sub { margin: 6px auto 0; max-width: 520px; color: rgb(255 255 255 / .75); font-size: 15px; }
+  main { max-width: 520px; margin: -36px auto 0; padding: 0 16px 40px; }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 18px; padding: 20px; box-shadow: 0 14px 36px -12px rgb(14 24 56 / .3); }
+  label { display: block; margin-top: 16px; font-weight: 700; font-size: 15px; }
+  label:first-child { margin-top: 0; }
+  .opt { float: right; font-weight: 400; font-size: 13px; color: var(--muted); }
+  input { display: block; width: 100%; min-height: 48px; margin-top: 6px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; font: inherit; background: #fff; color: var(--ink); }
+  input:focus { outline: none; border-color: var(--gold); box-shadow: 0 0 0 3px rgb(233 185 73 / .35); }
+  .phone { display: flex; margin-top: 6px; }
+  .phone span { display: grid; place-items: center; padding: 0 12px; border: 1px solid var(--line); border-right: 0; border-radius: 12px 0 0 12px; background: #f0ebe3; font-weight: 700; color: var(--muted); }
+  .phone input { margin: 0; border-radius: 0 12px 12px 0; }
+  .staff { margin-top: 22px; padding: 16px; border-radius: 14px; background: #f7ead0; }
+  .staff p { margin: 0 0 4px; font-size: 13px; color: var(--gold-text); font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+  .staff label { margin-top: 4px; }
+  .staff input { letter-spacing: .3em; font-weight: 800; text-align: center; font-size: 20px; }
+  button { width: 100%; min-height: 52px; margin-top: 20px; border: 0; border-radius: 14px; background: var(--gold); color: var(--ink); font: 800 17px system-ui, sans-serif; cursor: pointer; }
+  button:focus-visible, a:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
+  .error { margin: 0 0 14px; padding: 10px 12px; border-radius: 12px; background: #fbe4e8; color: var(--red); font-weight: 700; font-size: 15px; }
+  .ok { text-align: center; }
+  .ok .tick { display: inline-grid; place-items: center; width: 56px; height: 56px; border-radius: 50%; background: #e3f4ea; color: var(--green); font-size: 30px; font-weight: 800; }
+  .ok h2 { margin: 12px 0 4px; font: 600 22px Georgia, serif; }
+  .ok p { margin: 0; color: var(--muted); }
+  .again { display: block; margin-top: 18px; color: var(--ink); font-weight: 700; }
+  footer { margin-top: 24px; color: var(--muted); font-size: 13px; text-align: center; }
+</style>
+</head>
+<body>
+${body}
+</body>
+</html>`
+
+function entryFormPage(shopId, settings, values = {}, error = '') {
+  const v = (k) => escapeHtml(values[k] ?? '')
+  return pageShell(`Lucky-draw coupon — ${settings.label}`, `<header>
+  <p class="eyebrow">Dubai Mall Edakkara · Lucky draw</p>
+  <h1>Get your lucky-draw coupon</h1>
+  <p class="sub">${escapeHtml(settings.label)}</p>
+</header>
+<main>
+  <form class="card" method="post" action="/s/${shopId}" autocomplete="on">
+    ${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ''}
+    <label>Your name
+      <input name="name" value="${v('name')}" required maxlength="100" autocomplete="name">
+    </label>
+    <label>WhatsApp number
+      <span class="phone"><span>+91</span><input name="phone" value="${v('phone')}" required inputmode="tel" autocomplete="tel-national" placeholder="98470 12345"></span>
+    </label>
+    <label>Place <span class="opt">Optional</span>
+      <input name="place" value="${v('place')}" maxlength="60" placeholder="e.g. Edakkara">
+    </label>
+    <label>Bill number <span class="opt">Optional</span>
+      <input name="billNo" value="${v('billNo')}" maxlength="40">
+    </label>
+    <div class="staff">
+      <p>For shop staff</p>
+      <label>Shop code
+        <input name="code" required inputmode="numeric" autocomplete="off" maxlength="6" pattern="[0-9]{6}" placeholder="••••••">
+      </label>
+    </div>
+    <button type="submit">Submit</button>
+  </form>
+  <footer>Your coupon arrives on WhatsApp from the shop. Your number is used only for this lucky draw.</footer>
+</main>`)
+}
+
+const entryThanksPage = (shopId, settings, name) =>
+  pageShell('Thank you — Dubai Mall Edakkara', `<header>
+  <p class="eyebrow">Dubai Mall Edakkara · Lucky draw</p>
+  <h1>Thank you, ${escapeHtml(name)}!</h1>
+  <p class="sub">${escapeHtml(settings.label)}</p>
+</header>
+<main>
+  <div class="card ok" role="status">
+    <span class="tick" aria-hidden="true">✓</span>
+    <h2>Details received</h2>
+    <p>The shop will send your lucky-draw coupon to your WhatsApp in a moment.</p>
+    <a class="again" href="/s/${shopId}">Add another customer</a>
+  </div>
+  <footer>Wishing you and your family a joyful season! — Dubai Mall Edakkara</footer>
+</main>`)
+
+const formClosedPage = pageShell('QR code not active', `<header><p class="eyebrow">Dubai Mall Edakkara</p><h1>This QR code isn't active</h1></header>
+<main><div class="card ok"><p>Please ask at the shop counter for your lucky-draw coupon.</p></div></main>`)
+
+const normalisePhone = (raw) => {
+  let d = String(raw ?? '').replace(/\D/g, '')
+  if (d.length === 12 && d.startsWith('91')) d = d.slice(2)
+  if (d.length === 11 && d.startsWith('0')) d = d.slice(1)
+  return /^[6-9]\d{9}$/.test(d) ? d : null
+}
+
+/** A customer's details from the shop's QR form, confirmed with the shop's counter code. */
+async function submitEntry(req, shopId, settings) {
+  const form = new URLSearchParams((await readBody(req)).toString('utf8'))
+  const values = Object.fromEntries(['name', 'phone', 'place', 'billNo'].map((k) => [k, (form.get(k) ?? '').trim()]))
+  const fail = (error) => ({ page: entryFormPage(shopId, settings, values, error), status: 400 })
+  if (!values.name || values.name.length > 100) return fail('Please enter your name.')
+  const phone = normalisePhone(values.phone)
+  if (!phone) return fail('Please enter a 10-digit WhatsApp number.')
+  if (values.place.length > 60 || values.billNo.length > 40) return fail('Place or bill number is too long.')
+  const key = `entry|${req.headers['x-forwarded-for'] || req.socket.remoteAddress}|${shopId}`
+  if (throttled(key)) return { page: entryFormPage(shopId, settings, values, 'Too many wrong shop codes. Try again in 15 minutes.'), status: 429 }
+  const code = (form.get('code') ?? '').trim()
+  const want = Buffer.from(settings.code)
+  if (code.length !== want.length || !timingSafeEqual(Buffer.from(code), want)) {
+    noteFailure(key)
+    return fail('Wrong shop code. Shop staff: check the code in the voucher desk.')
+  }
+  failures.delete(key)
+  // The same customer submitting twice before the shop acts updates one entry instead of adding another.
+  const waiting = [...docs.entries.values()].find((e) => e.shopId === shopId && e.phone === phone && e.status === 'new')
+  const entry = {
+    ...(waiting ?? { id: `ent-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`, shopId, status: 'new' }),
+    createdAt: new Date().toISOString(),
+    customerName: values.name,
+    phone,
+    place: values.place || '—',
+    billNo: values.billNo,
+  }
+  putDoc('entries', entry)
+  console.log(`QR entry ${entry.id} · ${shopId} · ${entry.customerName}`)
+  return { page: entryThanksPage(shopId, settings, values.name), status: 200 }
+}
 
 // ---------- routes ----------
 
@@ -661,6 +889,19 @@ async function handle(req, res) {
     const cors = corsHeaders(req)
     if (req.method === 'OPTIONS') return send(res, 204, '', cors)
     return api(req, url, (status, data) => sendJson(res, status, data, cors))
+  }
+
+  const formRoute = /^\/s\/([a-z0-9][a-z0-9-]{1,39})$/.exec(url.pathname)
+  if (formRoute) {
+    const shopId = formRoute[1]
+    const html = { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': FORM_CSP, 'Cache-Control': 'no-store' }
+    if (!formOpen(shopId)) return send(res, 404, formClosedPage, html)
+    const settings = docs.shopSettings.get(shopId)
+    if (req.method === 'POST') {
+      const { page, status } = await submitEntry(req, shopId, settings)
+      return send(res, status, page, html)
+    }
+    if (req.method === 'GET' || req.method === 'HEAD') return send(res, 200, req.method === 'HEAD' ? '' : entryFormPage(shopId, settings), html)
   }
 
   if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'Method not allowed')

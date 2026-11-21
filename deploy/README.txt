@@ -56,10 +56,21 @@ STEP 3: DEPLOY
 
 STEP 4: CREATE THE SHOP LOGINS
   Open https://YOUR-DOMAIN/vouchers.html → log in as the mall admin →
-  "Shop logins" tab → "Create login" for each shop → Save password →
-  "Copy login" and send it to that shop.
+  "Shop logins" tab → "Create N missing logins" (each shop gets a codename
+  password, e.g. tanmay-falcon27) → "Copy all" or "CSV" and send each shop its login.
+  Passwords are shown once; "Set password" makes a new one for a single shop.
   Each shop logs in with its own username, issues vouchers only for itself,
   sees only its own vouchers, and manages its own sponsors.
+  Access rights per shop (same tab): Issue, QR form, Sponsors, and the power
+  button switches a login off completely.
+
+STEP 4b: SHOP QR CODES
+  Each shop: "My QR & code" tab → "Download poster" → print it for the counter.
+  The QR opens https://coupons.YOUR-DOMAIN/s/<shop>. The customer types their
+  name and WhatsApp number, staff type the 6-digit shop code shown in that tab,
+  and the customer appears under "Customers from QR" in the desk: pick the number
+  of vouchers → Release (opens WhatsApp). The mall admin sees every shop's QR in
+  the "QR codes" tab.
 
 
 STEP 5: CHECK

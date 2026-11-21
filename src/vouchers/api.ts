@@ -22,15 +22,23 @@ const base = (
 export const apiConfigured = base !== ''
 
 export type Role = 'admin' | 'shop'
+/** What a shop login may do; the mall admin switches these per shop. The admin has them all. */
+export type Right = 'issue' | 'sponsors' | 'qr'
+export type Rights = Record<Right, boolean>
 export interface User {
   username: string
   role: Role
   shopId: string | null
+  rights: Rights
+  disabled: boolean
 }
 export interface Login extends User {
   lastLoginAt: string | null
   passwordSetAt: string | null
+  createdAt: string | null
 }
+
+export const can = (user: User, right: Right) => user.role === 'admin' || user.rights?.[right] !== false
 
 // ---------- session token ----------
 
@@ -120,6 +128,8 @@ export const listLogins = () => request<{ users: Login[] }>('GET', '/api/users')
 export const setPassword = (username: string, password: string) =>
   request<{ user: User }>('PUT', `/api/users/${encodeURIComponent(username)}`, { password })
 export const removeLogin = (username: string) => request('DELETE', `/api/users/${encodeURIComponent(username)}`)
+export const updateLogin = (username: string, patch: { disabled?: boolean; rights?: Partial<Rights> }) =>
+  request<{ user: User }>('PATCH', `/api/users/${encodeURIComponent(username)}`, patch).then((d) => d.user)
 
 // ---------- vouchers ----------
 
@@ -136,6 +146,8 @@ export interface NewIssue {
   place: string
   billNo: string
   count: number
+  /** Set when releasing vouchers for a customer who filled in the shop's QR form. */
+  entryId?: string
 }
 
 export async function createIssue(draft: NewIssue): Promise<Issue> {
@@ -146,6 +158,39 @@ export async function createIssue(draft: NewIssue): Promise<Issue> {
 
 export const markSent = (id: string) =>
   request<{ issue: Issue }>('POST', `/api/issues/${encodeURIComponent(id)}/sent`).then((d) => d.issue)
+
+// ---------- QR customer form ----------
+
+/** A customer who filled in a shop's QR form, waiting for the shop to release vouchers. */
+export interface Entry {
+  id: string
+  shopId: string
+  customerName: string
+  phone: string
+  place: string
+  billNo: string
+  createdAt: string
+  status: 'new' | 'issued' | 'dismissed'
+  issueId?: string
+  handledAt?: string
+}
+
+export const listEntries = () => request<{ entries: Entry[] }>('GET', '/api/entries').then((d) => d.entries)
+export const dismissEntry = (id: string) => request('DELETE', `/api/entries/${encodeURIComponent(id)}`)
+
+/** A shop's QR form address and the counter code staff type to confirm an entry. */
+export interface ShopSettings {
+  shopId: string
+  label: string
+  code: string
+  codeSetAt: string
+  entryUrl: string
+}
+
+export const getShopSettings = (shopId: string, label: string) =>
+  request<{ settings: ShopSettings }>('POST', '/api/shop-settings', { shopId, label }).then((d) => d.settings)
+export const newShopCode = (shopId: string) =>
+  request<{ settings: ShopSettings }>('POST', '/api/shop-settings/new-code', { shopId }).then((d) => d.settings)
 
 // ---------- sponsors (each shop's own list) ----------
 

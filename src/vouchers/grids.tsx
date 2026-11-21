@@ -76,10 +76,42 @@ const statusCol: ColDef = {
   filterValueGetter: (p) => (p.data?.status === 'sent' ? 'Sent' : 'Not sent'),
 }
 
+/** Send (not yet sent) or Resend on WhatsApp, pinned at the row's right end. */
+function sendCol<T>(issueOf: (row: T) => Issue | undefined, onSend: (issue: Issue) => void): ColDef<T> {
+  return {
+    headerName: '',
+    colId: 'send',
+    width: 120,
+    pinned: 'right',
+    sortable: false,
+    filter: false,
+    resizable: false,
+    cellRenderer: (p: ICellRendererParams<T>) => {
+      const issue = p.data ? issueOf(p.data) : undefined
+      if (!issue) return null
+      const sent = issue.status === 'sent'
+      return (
+        <button
+          type="button"
+          onClick={() => onSend(issue)}
+          aria-label={`${sent ? 'Resend' : 'Send'} vouchers to ${issue.customerName} on WhatsApp`}
+          className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-bold transition-colors ${
+            sent ? 'border border-whatsapp/40 bg-white text-whatsapp hover:bg-[#e3f4ea]' : 'bg-whatsapp text-white hover:bg-whatsapp-hover'
+          }`}
+        >
+          {sent ? <Send className="size-3.5" /> : <WhatsAppIcon className="size-3.5" />}
+          {sent ? 'Resend' : 'Send'}
+        </button>
+      )
+    },
+  }
+}
+
 // ---------- Vouchers: one row per code ----------
 
 interface VoucherRow {
   code: string
+  issueId: string
   createdAt: string
   customerName: string
   phone: string
@@ -92,13 +124,15 @@ interface VoucherRow {
   status: IssueStatus
 }
 
-export function VoucherGrid({ issues, search, onReady }: GridProps) {
+export function VoucherGrid({ issues, search, onReady, onSend }: GridProps & { onSend: (issue: Issue) => void }) {
+  const byId = useMemo(() => new Map(issues.map((i) => [i.id, i])), [issues])
   const rows = useMemo<VoucherRow[]>(
     () =>
       issues.flatMap((i) => {
         const shop = shopById[i.shopId]
         return i.codes.map((code) => ({
           code,
+          issueId: i.id,
           createdAt: i.createdAt,
           customerName: i.customerName,
           phone: i.phone,
@@ -126,8 +160,9 @@ export function VoucherGrid({ issues, search, onReady }: GridProps) {
       { headerName: 'Shop location', field: 'location', width: 230 },
       { headerName: 'Bill no.', field: 'billNo', width: 120 },
       statusCol,
+      sendCol<VoucherRow>((r) => byId.get(r.issueId), onSend),
     ],
-    [],
+    [byId, onSend],
   )
   return <Grid rows={rows} cols={cols} search={search} onReady={onReady} rowId={(r) => r.code} />
 }
@@ -160,25 +195,7 @@ export function PurchaseGrid({ issues, search, onReady, onSend }: GridProps & { 
         tooltipValueGetter: (p) => p.value,
       },
       statusCol,
-      {
-        headerName: '',
-        colId: 'send',
-        width: 120,
-        pinned: 'right',
-        sortable: false,
-        filter: false,
-        resizable: false,
-        cellRenderer: (p: ICellRendererParams<Issue>) => (
-          <button
-            type="button"
-            onClick={() => onSend(p.data!)}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-whatsapp px-2.5 py-1 text-xs font-bold text-white hover:bg-whatsapp-hover"
-          >
-            {p.data!.status === 'sent' ? <Send className="size-3.5" /> : <WhatsAppIcon className="size-3.5" />}
-            {p.data!.status === 'sent' ? 'Resend' : 'Send'}
-          </button>
-        ),
-      },
+      sendCol<Issue>((i) => i, onSend),
     ],
     [onSend],
   )
