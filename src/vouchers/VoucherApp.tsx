@@ -242,6 +242,13 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [target, setTarget] = useState<WhatsAppTarget>('web')
   const [last, setLast] = useState<Issue | null>(null)
   const [sendResult, setSendResult] = useState<SendResult | null>(null)
+  // Short message at the bottom of the screen: sends start from the lists too, far below the panel.
+  const [toast, setToast] = useState<{ text: string; tone: 'ok' | 'warn' } | null>(null)
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(null), 5000)
+    return () => clearTimeout(t)
+  }, [toast])
   const [draft, setDraft] = useState<Draft>(emptyDraft)
   const [tab, setTab] = useState<Tab>('vouchers')
   const [search, setSearch] = useState('')
@@ -269,7 +276,11 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
       // Render the hidden coupon for this purchase right away so it can be turned into a PNG.
       flushSync(() => setLast(i))
       const node = captureNode()
-      const tab = opened === undefined ? window.open('', WA_WINDOW) : opened
+      // When the coupon link is already saved (a resend), open WhatsApp straight at the chat. Opening a blank
+      // tab and pointing it at WhatsApp afterwards fails when the WhatsApp tab is already open, and WhatsApp
+      // Web cuts its tab off from the desk, so a later redirect can silently do nothing.
+      const direct = opened === undefined && i.couponUrl ? window.open(whatsappUrl(i, target), WA_WINDOW) : undefined
+      const tab = direct !== undefined ? direct : opened === undefined ? window.open('', WA_WINDOW) : opened
       let ready = i
       if (i.couponUrl) {
         setSendResult('linked')
@@ -284,8 +295,18 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
           setSendResult('upload-failed')
         }
       }
-      if (!tab) return setLast(ready) // pop-up blocked: stays "not yet sent"
-      tab.location.href = whatsappUrl(ready, target)
+      if (!tab) {
+        // pop-up blocked: stays "not yet sent"
+        setToast({ text: 'The browser blocked WhatsApp. Allow pop-ups for this page, then press Send again.', tone: 'warn' })
+        return setLast(ready)
+      }
+      if (direct === undefined) tab.location.href = whatsappUrl(ready, target)
+      try {
+        tab.focus()
+      } catch {
+        // already WhatsApp's own tab
+      }
+      setToast({ text: `WhatsApp opened for ${ready.customerName}. Press Send in WhatsApp.`, tone: 'ok' })
       try {
         const sent = await markSent(ready.id)
         upsert(sent)
@@ -337,6 +358,16 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
   return (
     <div className="min-h-screen">
       {last && <CouponCapture issue={last} />}
+      {toast && (
+        <p
+          role="status"
+          className={`fixed bottom-5 left-1/2 z-50 w-[min(92vw,520px)] -translate-x-1/2 rounded-xl px-4 py-3 text-sm font-semibold shadow-lift ${
+            toast.tone === 'ok' ? 'bg-ink text-white' : 'bg-gold-soft text-gold-text ring-1 ring-gold'
+          }`}
+        >
+          {toast.text}
+        </p>
+      )}
       <header className="arch-pattern bg-ink text-white">
         <div className="mx-auto flex max-w-[1400px] flex-wrap items-center justify-between gap-4 px-4 py-5 sm:px-6">
           <div className="flex items-center gap-3">
