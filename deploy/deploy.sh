@@ -329,13 +329,35 @@ say "9/9  Checking the coupon server"
 if [ "$FILES_ONLY" -eq 1 ]; then
   info "skipped (--files-only)"
 elif command -v curl >/dev/null; then
-  HEALTH=""
-  for _ in 1 2 3 4 5; do
-    HEALTH="$(curl -s -m 15 -H "Host: $COUPONS_HOST" http://127.0.0.1/healthz || true)"
-    grep -q '"ok":true' <<<"$HEALTH" && break
+  # cPanel sites listen on the server's own IP address(es), not on 127.0.0.1, so ask the site the way
+  # a phone would (its public https address) and, if DNS isn't ready, straight at this server's IPs.
+  HEALTH_IPS="$(
+    {
+      printf '%s\n' "${COUPON_IP:-}"
+      cat /var/cpanel/mainip 2>/dev/null || true
+      echo
+      hostname -I 2>/dev/null | tr ' ' '\n' || true
+      echo 127.0.0.1
+    } | grep -E '^[0-9]+(\.[0-9]+){3}$' | awk '!seen[$0]++' || true
+  )"
+  health_ok() {
+    local out ip
+    out="$(curl -s -m 10 "https://$COUPONS_HOST/healthz" || true)"
+    grep -q '"ok":true' <<<"$out" && return 0
+    for ip in $HEALTH_IPS; do
+      out="$(curl -sk -m 10 --resolve "$COUPONS_HOST:443:$ip" "https://$COUPONS_HOST/healthz" || true)"
+      grep -q '"ok":true' <<<"$out" && return 0
+      out="$(curl -s -m 10 -H "Host: $COUPONS_HOST" "http://$ip/healthz" || true)"
+      grep -q '"ok":true' <<<"$out" && return 0
+    done
+    return 1
+  }
+  HEALTHY=0
+  for _ in 1 2 3 4 5; do # the app may take a few seconds to start after the restart
+    if health_ok; then HEALTHY=1; break; fi
     sleep 3
   done
-  if grep -q '"ok":true' <<<"$HEALTH"; then
+  if [ "$HEALTHY" -eq 1 ]; then
     ok "Coupon server is answering at $COUPONS_HOST"
   else
     warn "Coupon server didn't answer yet. Check the log: $APP/stderr.log or cPanel → Setup Node.js App."
