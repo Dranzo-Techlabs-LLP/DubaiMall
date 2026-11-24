@@ -70,8 +70,10 @@ export interface Issue {
   sentAt?: string
   /** Ids into the sponsor library — images are stored once there, not copied onto every voucher. */
   sponsorIds?: string[]
-  /** Public link that downloads the coupon image, once it has been uploaded. */
+  /** Public link to the customer's coupon page, reserved when the voucher is made. */
   couponUrl?: string
+  /** True until the coupon image has been uploaded to that link. */
+  couponPending?: boolean
   /** Login that issued it (a shop, or the mall admin). */
   issuedBy?: string
 }
@@ -146,5 +148,6 @@ export function whatsappUrl(issue: Issue, target: WhatsAppTarget) {
   const text = encodeURIComponent(voucherMessage(issue))
   return target === 'web'
     ? `https://web.whatsapp.com/send?phone=${phone}&text=${text}`
-    : `https://wa.me/${phone}?text=${text}`
+    : // Straight into the installed app: wa.me would first load a web page that asks to open it.
+      `whatsapp://send?phone=${phone}&text=${text}`
 }

@@ -50,6 +50,7 @@ const MAX_BODY = 6 * 1024 * 1024 // a coupon PNG is ~200 KB; sponsor logos up to
 const MAX_CODES = 500
 const SESSION_DAYS = 14
 const ID_PATTERN = '[A-Za-z0-9_-]{12}'
+const COUPON_ID = new RegExp(`^${ID_PATTERN}$`)
 
 function lanAddress() {
   for (const list of Object.values(networkInterfaces())) {
@@ -471,6 +472,9 @@ async function api(req, url, reply) {
     if (!Number.isInteger(count) || count < 1 || count > MAX_CODES) throw bad('Invalid number of vouchers')
     // The voucher remembers the shop's sponsors at this moment, so later changes don't alter it.
     const sponsors = docs.sponsors.get(shopId)?.list ?? []
+    // The coupon link is reserved now, so the desk can open WhatsApp straight away and upload the
+    // coupon image while the chat loads. Until the image arrives the link shows "being prepared".
+    const couponId = randomBytes(9).toString('base64url') // 12 characters, unguessable
     const issue = {
       id: `iss-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`,
       createdAt: new Date().toISOString(),
@@ -482,6 +486,9 @@ async function api(req, url, reply) {
       codes: newCodes(count),
       status: 'pending',
       issuedBy: user.id,
+      couponId,
+      couponUrl: linkFor(couponId),
+      couponPending: true,
       ...(entry ? { entryId: entry.id } : {}),
       ...(sponsors.length ? { sponsorIds: sponsors.map((s) => s.id) } : {}),
     }
@@ -603,9 +610,14 @@ async function api(req, url, reply) {
     const issue = docs.issues.get(coupon.issueId)
     if (!issue || !canSeeShop(user, issue.shopId)) return reply(404, { error: 'Voucher not found' })
     // Sending again for the same purchase reuses its link.
+    const { couponPending: _pending, ...saved } = issue
     const existing = store.idForIssue(issue.id)
-    if (existing) return reply(200, { id: existing, url: linkFor(existing) })
-    const id = randomBytes(9).toString('base64url') // 12 characters, unguessable
+    if (existing) {
+      if (issue.couponPending) putDoc('issues', { ...saved, couponUrl: linkFor(existing) })
+      return reply(200, { id: existing, url: linkFor(existing) })
+    }
+    // Use the link reserved when the voucher was made (older vouchers get a new one).
+    const id = typeof issue.couponId === 'string' && COUPON_ID.test(issue.couponId) ? issue.couponId : randomBytes(9).toString('base64url')
     store.add({
       id,
       issue_id: issue.id,
@@ -619,7 +631,7 @@ async function api(req, url, reply) {
       height: coupon.height,
       created_at: new Date().toISOString(),
     })
-    putDoc('issues', { ...issue, couponUrl: linkFor(id) })
+    putDoc('issues', { ...saved, couponUrl: linkFor(id) })
     console.log(`coupon ${id} saved · ${issue.customerName} · ${issue.codes.length} code(s)`)
     return reply(201, { id, url: linkFor(id) })
   }
@@ -733,6 +745,17 @@ function couponPage(c) {
 const notFoundPage = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Coupon not found</title></head>
 <body style="font:16px/1.5 system-ui,sans-serif;margin:0;padding:48px 16px;text-align:center;background:#faf7f2;color:#0e1838">
 <h1 style="font:600 24px Georgia,serif">Coupon not found</h1><p>Please check the link in your WhatsApp message, or ask at the Dubai Mall Edakkara counter.</p></body></html>`
+
+// Shown when the customer opens the link before the desk has finished uploading the image; reloads itself.
+const preparingPage = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><meta http-equiv="refresh" content="3"><title>Your coupon is on its way</title></head>
+<body style="font:16px/1.5 system-ui,sans-serif;margin:0;padding:48px 16px;text-align:center;background:#faf7f2;color:#0e1838">
+<h1 style="font:600 24px Georgia,serif">Your coupon is on its way</h1><p>It will appear here in a few seconds.</p></body></html>`
+
+/** True when a voucher has reserved this coupon link but its image isn't uploaded yet. */
+const couponIsPending = (id) => {
+  for (const i of docs.issues.values()) if (i.couponId === id) return Boolean(i.couponPending)
+  return false
+}
 
 const PAGE_CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 const FORM_CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
@@ -911,6 +934,13 @@ async function handle(req, res) {
   const match = couponRoute.exec(url.pathname)
   if (match) {
     const coupon = store.get(match[1])
+    if (!coupon && !match[2] && couponIsPending(match[1])) {
+      return send(res, 200, req.method === 'HEAD' ? '' : preparingPage, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Security-Policy': PAGE_CSP,
+        'Cache-Control': 'no-store',
+      })
+    }
     if (!coupon) return send(res, 404, notFoundPage, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': PAGE_CSP })
     if (match[2]) {
       const headers = {

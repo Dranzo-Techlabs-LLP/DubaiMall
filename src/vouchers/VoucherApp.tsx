@@ -111,6 +111,30 @@ const couponUpload = (i: Issue) => {
 
 const errorText = (err: unknown, fallback = 'Something went wrong') => (err instanceof Error && err.message) || fallback
 
+/** Writes "Opening WhatsApp…" into a tab we just opened, so staff don't stare at a blank white page. */
+function showOpening(tab: Window | null) {
+  try {
+    if (!tab) return
+    const doc = tab.document
+    doc.title = 'Opening WhatsApp…'
+    const p = doc.createElement('p')
+    p.textContent = 'Opening WhatsApp…'
+    p.setAttribute('style', 'font:600 18px system-ui,sans-serif;color:#1f8f4e;text-align:center;margin-top:35vh')
+    doc.body.replaceChildren(p)
+  } catch {
+    // not our blank tab any more
+  }
+}
+
+const TARGET_KEY = 'dme-whatsapp-target'
+const savedTarget = (): WhatsAppTarget => {
+  try {
+    return localStorage.getItem(TARGET_KEY) === 'app' ? 'app' : 'web'
+  } catch {
+    return 'web'
+  }
+}
+
 /** Closes a tab we opened for WhatsApp only while it's still blank — never a WhatsApp tab in use. */
 function closeIfBlank(tab: Window | null) {
   try {
@@ -239,7 +263,15 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
   const canIssue = can(user, 'issue')
   const canQr = can(user, 'qr')
   const { entries, error: entriesError, reload: reloadEntries } = useEntries(canQr)
-  const [target, setTarget] = useState<WhatsAppTarget>('web')
+  const [target, setTargetState] = useState<WhatsAppTarget>(savedTarget)
+  const setTarget = useCallback((t: WhatsAppTarget) => {
+    setTargetState(t)
+    try {
+      localStorage.setItem(TARGET_KEY, t)
+    } catch {
+      // private window: the choice lasts until reload
+    }
+  }, [])
   const [last, setLast] = useState<Issue | null>(null)
   const [sendResult, setSendResult] = useState<SendResult | null>(null)
   // Short message at the bottom of the screen: sends start from the lists too, far below the panel.
@@ -267,46 +299,66 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
   }, [issues])
 
   /**
-   * Uploads the coupon image (once per purchase), then points the WhatsApp tab at the customer's chat
-   * with the greeting and the coupon link typed in, and marks the voucher sent.
-   * `opened` is a tab already opened during the click (so pop-up blockers allow it).
+   * Opens the customer's WhatsApp chat with the greeting and the coupon link typed in, uploads the coupon
+   * image while the chat loads, and marks the voucher sent.
+   * `opened` is a WhatsApp Web tab already opened during the click (so pop-up blockers allow it).
    */
   const send = useCallback(
     async (i: Issue, opened?: Window | null) => {
       // Render the hidden coupon for this purchase right away so it can be turned into a PNG.
       flushSync(() => setLast(i))
       const node = captureNode()
-      // When the coupon link is already saved (a resend), open WhatsApp straight at the chat. Opening a blank
-      // tab and pointing it at WhatsApp afterwards fails when the WhatsApp tab is already open, and WhatsApp
-      // Web cuts its tab off from the desk, so a later redirect can silently do nothing.
-      const direct = opened === undefined && i.couponUrl ? window.open(whatsappUrl(i, target), WA_WINDOW) : undefined
-      const tab = direct !== undefined ? direct : opened === undefined ? window.open('', WA_WINDOW) : opened
-      let ready = i
-      if (i.couponUrl) {
-        setSendResult('linked')
-      } else {
+      const app = target === 'app'
+      const upload = async (from: Issue): Promise<Issue> => {
         try {
           if (!node) throw new Error('Coupon not rendered')
-          const url = await uploadCoupon(await nodeToPng(node), couponUpload(i))
-          ready = { ...i, couponUrl: url }
-          upsert(ready)
+          const url = await uploadCoupon(await nodeToPng(node), couponUpload(from))
+          const done = { ...from, couponUrl: url, couponPending: false }
+          upsert(done)
           setSendResult('linked')
+          return done
         } catch {
           setSendResult('upload-failed')
+          return from
         }
       }
-      if (!tab) {
-        // pop-up blocked: stays "not yet sent"
+      setSendResult('linked')
+
+      // New vouchers carry their coupon link from the start, so the chat can open right away. WhatsApp Web
+      // cuts its tab off from the desk, so a tab is pointed at the chat once and never reused.
+      const direct = !app && opened === undefined && Boolean(i.couponUrl)
+      let tab: Window | null = null
+      if (!app) {
+        tab = opened !== undefined ? opened : window.open(direct ? whatsappUrl(i, 'web') : '', WA_WINDOW)
+        if (!direct) showOpening(tab)
+      }
+      // Vouchers made before links were reserved: upload first so the greeting can carry the link.
+      let ready = i.couponUrl ? i : await upload(i)
+
+      if (!app && !tab) {
+        // pop-up blocked: stays "not yet sent", but the image is uploaded for the next try
         setToast({ text: 'The browser blocked WhatsApp. Allow pop-ups for this page, then press Send again.', tone: 'warn' })
+        if (ready.couponPending) ready = await upload(ready)
         return setLast(ready)
       }
-      if (direct === undefined) tab.location.href = whatsappUrl(ready, target)
+      if (app) {
+        window.location.href = whatsappUrl(ready, 'app')
+      } else if (tab && !direct) {
+        tab.location.href = whatsappUrl(ready, 'web')
+      }
       try {
-        tab.focus()
+        tab?.focus()
       } catch {
         // already WhatsApp's own tab
       }
-      setToast({ text: `WhatsApp opened for ${ready.customerName}. Press Send in WhatsApp.`, tone: 'ok' })
+      setToast({
+        text: app
+          ? `Opening the WhatsApp app for ${ready.customerName}. If nothing opens, switch to WhatsApp Web.`
+          : `WhatsApp opened for ${ready.customerName}. Press Send in WhatsApp.`,
+        tone: 'ok',
+      })
+      // The coupon image uploads while WhatsApp loads; the link shows "on its way" until it arrives.
+      if (ready.couponPending) ready = await upload(ready)
       try {
         const sent = await markSent(ready.id)
         upsert(sent)
@@ -320,7 +372,9 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
 
   /** Saves the voucher on the server (which makes the codes), then sends it. Returns an error message, or null. */
   const issue = async (newIssue: NewIssue, beforeCreate: () => Promise<void>): Promise<string | null> => {
-    const tab = window.open('', WA_WINDOW) // open now, while the click still counts
+    // WhatsApp Web: open the tab now, while the click still counts for the pop-up blocker.
+    const tab = target === 'web' ? window.open('', WA_WINDOW) : undefined
+    showOpening(tab ?? null)
     try {
       await beforeCreate()
       const created = await createIssue(newIssue)
@@ -328,7 +382,7 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
       void send(created, tab)
       return null
     } catch (err) {
-      closeIfBlank(tab)
+      closeIfBlank(tab ?? null)
       return errorText(err, 'Could not save the voucher')
     }
   }
@@ -857,6 +911,11 @@ function IssueForm({
               </button>
             ))}
           </div>
+          <p className="basis-full text-xs text-muted">
+            {target === 'web'
+              ? 'WhatsApp Web loads again for every customer. With the WhatsApp app installed on this PC, “WhatsApp app” opens the chat at once.'
+              : 'Opens the chat in the WhatsApp app on this PC or phone. If nothing opens, install WhatsApp or switch to WhatsApp Web.'}
+          </p>
         </div>
         {formError && (
           <p role="alert" className="rounded-lg bg-crimson-soft px-3 py-2 text-sm font-semibold text-crimson">
@@ -1269,7 +1328,7 @@ function LastIssued({
           {issue.status === 'pending'
             ? 'The browser blocked the WhatsApp tab. Allow pop-ups for this page, then press “Open WhatsApp chat”.'
             : sendResult === 'upload-failed'
-              ? 'The coupon could not be uploaded, so the chat opened without the download link. Check the internet and press “Open WhatsApp chat” to try again, or attach the image yourself.'
+              ? 'The coupon image could not be uploaded, so the link in the message won’t show it yet. Check the internet and press “Open WhatsApp chat” to upload it again, or attach the image yourself.'
               : 'The chat is open with the greeting and a link to download the coupon image. Press Send in WhatsApp.'}
         </p>
         {issue.couponUrl && (
