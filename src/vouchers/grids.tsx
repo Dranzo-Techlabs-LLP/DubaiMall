@@ -107,11 +107,12 @@ function sendCol<T>(issueOf: (row: T) => Issue | undefined, onSend: (issue: Issu
   }
 }
 
-// ---------- Vouchers: one row per code ----------
+// ---------- Vouchers: one row per customer release, all its codes together ----------
 
 interface VoucherRow {
-  code: string
   issueId: string
+  codes: string
+  count: number
   createdAt: string
   customerName: string
   phone: string
@@ -128,11 +129,12 @@ export function VoucherGrid({ issues, search, onReady, onSend }: GridProps & { o
   const byId = useMemo(() => new Map(issues.map((i) => [i.id, i])), [issues])
   const rows = useMemo<VoucherRow[]>(
     () =>
-      issues.flatMap((i) => {
+      issues.map((i) => {
         const shop = shopById[i.shopId]
-        return i.codes.map((code) => ({
-          code,
+        return {
           issueId: i.id,
+          codes: i.codes.join(', '),
+          count: i.codes.length,
           createdAt: i.createdAt,
           customerName: i.customerName,
           phone: i.phone,
@@ -143,13 +145,22 @@ export function VoucherGrid({ issues, search, onReady, onSend }: GridProps & { o
           location: shop.location,
           billNo: i.billNo,
           status: i.status,
-        }))
+        }
       }),
     [issues],
   )
   const cols = useMemo<ColDef<VoucherRow>[]>(
     () => [
-      { headerName: 'Voucher code', field: 'code', pinned: 'left', width: 150, cellClass: 'font-mono font-bold text-ink' },
+      {
+        headerName: 'Voucher codes',
+        field: 'codes',
+        pinned: 'left',
+        width: 260,
+        wrapText: true,
+        autoHeight: true,
+        cellClass: 'font-mono font-bold text-ink leading-6 py-1.5',
+      },
+      { ...countCol('Vouchers', 'count'), width: 115 },
       dateCol,
       { headerName: 'Customer', field: 'customerName', width: 170 },
       { headerName: 'WhatsApp no.', field: 'phone', width: 150, valueFormatter: phoneFmt },
@@ -164,7 +175,7 @@ export function VoucherGrid({ issues, search, onReady, onSend }: GridProps & { o
     ],
     [byId, onSend],
   )
-  return <Grid rows={rows} cols={cols} search={search} onReady={onReady} rowId={(r) => r.code} />
+  return <Grid rows={rows} cols={cols} search={search} onReady={onReady} rowId={(r) => r.issueId} />
 }
 
 // ---------- Purchases: one row per bill ----------
