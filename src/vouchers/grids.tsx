@@ -178,6 +178,10 @@ export function VoucherGrid({ issues, search, onReady, onSend }: GridProps & { o
   return <Grid rows={rows} cols={cols} search={search} onReady={onReady} rowId={(r) => r.issueId} />
 }
 
+/** How a voucher was made, so QR-form vouchers stand out from ones issued at the desk. */
+const sourceLabel = (i: Issue) =>
+  i.source === 'qr-form' ? 'QR form (automatic)' : i.source === 'qr-release' || i.entryId ? 'QR form (shop released)' : 'Voucher desk'
+
 // ---------- Purchases: one row per bill ----------
 
 export function PurchaseGrid({ issues, search, onReady, onSend }: GridProps & { onSend: (issue: Issue) => void }) {
@@ -191,6 +195,20 @@ export function PurchaseGrid({ issues, search, onReady, onSend }: GridProps & { 
       { headerName: 'Shop', valueGetter: (p) => shopById[p.data!.shopId].name, width: 190 },
       { headerName: 'Shop location', valueGetter: (p) => shopById[p.data!.shopId].location, width: 230 },
       { headerName: 'Bill no.', field: 'billNo', width: 120 },
+      {
+        headerName: 'Bill amount',
+        field: 'billAmount',
+        type: 'rightAligned',
+        width: 130,
+        filter: 'agNumberColumnFilter',
+        valueFormatter: (p) => (typeof p.value === 'number' ? `₹${p.value.toLocaleString('en-IN')}` : '—'),
+      },
+      {
+        headerName: 'Made by',
+        valueGetter: (p) => sourceLabel(p.data!),
+        width: 170,
+        tooltipValueGetter: (p) => p.value,
+      },
       {
         headerName: 'Vouchers',
         valueGetter: (p) => p.data!.codes.length,

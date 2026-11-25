@@ -146,6 +146,10 @@ export interface NewIssue {
   place: string
   billNo: string
   count: number
+  /** The bill amount in rupees, saved with the voucher. */
+  billAmount?: number
+  /** Shop name as printed on the coupon. */
+  shopLabel?: string
   /** Set when releasing vouchers for a customer who filled in the shop's QR form. */
   entryId?: string
 }
@@ -169,6 +173,8 @@ export interface Entry {
   phone: string
   place: string
   billNo: string
+  /** The bill amount the customer typed on the QR form. */
+  billAmount?: number
   createdAt: string
   status: 'new' | 'issued' | 'dismissed'
   issueId?: string
@@ -185,7 +191,16 @@ export interface ShopSettings {
   code: string
   codeSetAt: string
   entryUrl: string
+  /** The form's bill number field: must be filled, may be filled, or not shown. */
+  billNo: BillNoMode
+  /** True: the form asks the bill amount and gives 1 voucher per ₹1,000. False: no amount field, 1 voucher. */
+  byAmount: boolean
 }
+
+export type BillNoMode = 'required' | 'optional' | 'off'
+
+export const saveFormOptions = (shopId: string, options: { billNo?: BillNoMode; byAmount?: boolean }) =>
+  request<{ settings: ShopSettings }>('POST', '/api/shop-settings/options', { shopId, ...options }).then((d) => d.settings)
 
 export const getShopSettings = (shopId: string, label: string) =>
   request<{ settings: ShopSettings }>('POST', '/api/shop-settings', { shopId, label }).then((d) => d.settings)

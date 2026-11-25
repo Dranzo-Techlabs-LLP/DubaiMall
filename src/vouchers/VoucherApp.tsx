@@ -126,15 +126,6 @@ function showOpening(tab: Window | null) {
   }
 }
 
-const TARGET_KEY = 'dme-whatsapp-target'
-const savedTarget = (): WhatsAppTarget => {
-  try {
-    return localStorage.getItem(TARGET_KEY) === 'app' ? 'app' : 'web'
-  } catch {
-    return 'web'
-  }
-}
-
 /** Closes a tab we opened for WhatsApp only while it's still blank — never a WhatsApp tab in use. */
 function closeIfBlank(tab: Window | null) {
   try {
@@ -263,15 +254,8 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
   const canIssue = can(user, 'issue')
   const canQr = can(user, 'qr')
   const { entries, error: entriesError, reload: reloadEntries } = useEntries(canQr)
-  const [target, setTargetState] = useState<WhatsAppTarget>(savedTarget)
-  const setTarget = useCallback((t: WhatsAppTarget) => {
-    setTargetState(t)
-    try {
-      localStorage.setItem(TARGET_KEY, t)
-    } catch {
-      // private window: the choice lasts until reload
-    }
-  }, [])
+  // Send, Resend and Release open WhatsApp Web (the desk no longer offers a Web/app choice).
+  const target = 'web' as WhatsAppTarget
   const [last, setLast] = useState<Issue | null>(null)
   const [sendResult, setSendResult] = useState<SendResult | null>(null)
   // Short message at the bottom of the screen: sends start from the lists too, far below the panel.
@@ -371,15 +355,22 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
   )
 
   /** Saves the voucher on the server (which makes the codes), then sends it. Returns an error message, or null. */
-  const issue = async (newIssue: NewIssue, beforeCreate: () => Promise<void>): Promise<string | null> => {
+  const issue = async (newIssue: NewIssue, beforeCreate: () => Promise<void>, openWhatsApp = true): Promise<string | null> => {
     // WhatsApp Web: open the tab now, while the click still counts for the pop-up blocker.
-    const tab = target === 'web' ? window.open('', WA_WINDOW) : undefined
+    const tab = openWhatsApp && target === 'web' ? window.open('', WA_WINDOW) : undefined
     showOpening(tab ?? null)
     try {
       await beforeCreate()
       const created = await createIssue(newIssue)
       upsert(created)
-      void send(created, tab)
+      if (openWhatsApp) {
+        void send(created, tab)
+      } else {
+        // Saved only: the panel shows the vouchers, with "Open WhatsApp chat" to send them later.
+        setSendResult(null)
+        setLast(created)
+        setToast({ text: `${created.codes.length} voucher${created.codes.length === 1 ? '' : 's'} saved for ${created.customerName}.`, tone: 'ok' })
+      }
       return null
     } catch (err) {
       closeIfBlank(tab ?? null)
@@ -390,7 +381,16 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
   /** Vouchers for a customer from the QR form: their details come from the entry. Call straight from the click. */
   const release = async (entry: Entry, count: number) => {
     const error = await issue(
-      { shopId: entry.shopId, customerName: entry.customerName, phone: entry.phone, place: entry.place, billNo: entry.billNo, count, entryId: entry.id },
+      {
+        shopId: entry.shopId,
+        customerName: entry.customerName,
+        phone: entry.phone,
+        place: entry.place,
+        billNo: entry.billNo,
+        count,
+        entryId: entry.id,
+        shopLabel: shopById[entry.shopId] ? `${shopById[entry.shopId].name} (Shop ${shopById[entry.shopId].shopNo})` : undefined,
+      },
       async () => {},
     )
     void reloadEntries()
@@ -501,7 +501,7 @@ function Desk({ user, onLogout }: { user: User; onLogout: () => void }) {
 
         <div className="grid items-start gap-6 lg:grid-cols-[440px_1fr]">
           {canIssue ? (
-            <IssueForm user={user} target={target} onTarget={setTarget} onIssue={issue} onDraft={setDraft} />
+            <IssueForm user={user} onIssue={(newIssue, beforeCreate) => issue(newIssue, beforeCreate, false)} onDraft={setDraft} />
           ) : (
             <div className="rounded-2xl border border-line bg-white p-6 shadow-card">
               <h2 className="text-xl font-semibold text-ink">Issuing is switched off</h2>
@@ -623,14 +623,10 @@ function Stat({
 
 function IssueForm({
   user,
-  target,
-  onTarget,
   onIssue,
   onDraft,
 }: {
   user: User
-  target: WhatsAppTarget
-  onTarget: (t: WhatsAppTarget) => void
   onIssue: (issue: NewIssue, beforeCreate: () => Promise<void>) => Promise<string | null>
   onDraft: (draft: Draft) => void
 }) {
@@ -691,7 +687,16 @@ function IssueForm({
     setBusy(true)
     // The server puts the shop's saved sponsors on the voucher, so save any edits first.
     const error = await onIssue(
-      { shopId, customerName: name.trim(), phone: normalised!, place: place.trim(), billNo: billNo.trim(), count },
+      {
+        shopId,
+        customerName: name.trim(),
+        phone: normalised!,
+        place: place.trim(),
+        billNo: billNo.trim(),
+        count,
+        billAmount: amt,
+        shopLabel: shop ? `${shop.name} (Shop ${shop.shopNo})` : undefined,
+      },
       sponsorsState.flush,
     )
     setBusy(false)
@@ -800,7 +805,7 @@ function IssueForm({
           )}
 
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Bill amount (₹)" hint="Not saved" error={err('amount')}>
+            <Field label="Bill amount (₹)" error={err('amount')}>
               <input
                 inputMode="numeric"
                 value={amount}
@@ -892,31 +897,6 @@ function IssueForm({
       </div>
 
       <div className="space-y-3 rounded-b-2xl border-t border-line bg-ivory px-5 py-4 sm:px-6">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <span id="open-in" className="text-sm font-semibold text-ink">
-            Open in
-          </span>
-          <div role="group" aria-labelledby="open-in" className="inline-flex rounded-lg bg-sand p-1">
-            {(['web', 'app'] as const).map((t) => (
-              <button
-                key={t}
-                type="button"
-                aria-pressed={target === t}
-                onClick={() => onTarget(t)}
-                className={`min-h-9 rounded-md px-3 text-sm font-semibold transition-colors ${
-                  target === t ? 'bg-white text-ink shadow-card' : 'text-muted hover:text-ink'
-                }`}
-              >
-                {t === 'web' ? 'WhatsApp Web' : 'WhatsApp app'}
-              </button>
-            ))}
-          </div>
-          <p className="basis-full text-xs text-muted">
-            {target === 'web'
-              ? 'WhatsApp Web loads again for every customer. With the WhatsApp app installed on this PC, “WhatsApp app” opens the chat at once.'
-              : 'Opens the chat in the WhatsApp app on this PC or phone. If nothing opens, install WhatsApp or switch to WhatsApp Web.'}
-          </p>
-        </div>
         {formError && (
           <p role="alert" className="rounded-lg bg-crimson-soft px-3 py-2 text-sm font-semibold text-crimson">
             {formError}
@@ -925,12 +905,10 @@ function IssueForm({
         <button
           type="submit"
           disabled={busy}
-          className="inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-whatsapp px-4 py-3 font-bold text-white shadow-lift transition-[background-color,transform] duration-150 hover:bg-whatsapp-hover active:scale-[0.99] disabled:opacity-60"
+          className="inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-ink px-4 py-3 font-bold text-white shadow-lift transition-[background-color,transform] duration-150 hover:bg-ink-soft active:scale-[0.99] disabled:opacity-60"
         >
-          <WhatsAppIcon className="size-5" />
-          {busy
-            ? 'Saving vouchers…'
-            : `Generate ${count > 0 && eligible > 0 ? `${count} ` : ''}voucher${count === 1 ? '' : 's'} & open WhatsApp`}
+          <Ticket className="size-5" aria-hidden />
+          {busy ? 'Saving vouchers…' : `Generate ${count > 0 && eligible > 0 ? `${count} ` : ''}voucher${count === 1 ? '' : 's'}`}
         </button>
       </div>
     </form>
@@ -1325,7 +1303,9 @@ function LastIssued({
           <WhatsAppIcon className="size-4 text-whatsapp" /> Send the coupon image
         </p>
         <p role="status" className="mt-1 text-sm text-ink/80">
-          {issue.status === 'pending'
+          {issue.status === 'pending' && sendResult === null
+            ? 'Vouchers saved. Press “Open WhatsApp chat” to send them to the customer, or copy or download the coupon image.'
+            : issue.status === 'pending'
             ? 'The browser blocked the WhatsApp tab. Allow pop-ups for this page, then press “Open WhatsApp chat”.'
             : sendResult === 'upload-failed'
               ? 'The coupon image could not be uploaded, so the link in the message won’t show it yet. Check the internet and press “Open WhatsApp chat” to upload it again, or attach the image yourself.'

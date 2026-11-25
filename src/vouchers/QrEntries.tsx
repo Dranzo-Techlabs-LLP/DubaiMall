@@ -2,7 +2,7 @@ import { Minus, Plus, QrCode, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { WhatsAppIcon } from '../components/ShopCard'
 import { can, type Entry, type User } from './api'
-import { shopById } from './data'
+import { eligibleVouchers, inr, shopById } from './data'
 
 const MAX_RELEASE = 50
 
@@ -101,7 +101,8 @@ function EntryRow({
   onRelease: (entry: Entry, count: number) => Promise<string | null>
   onDismiss: (entry: Entry) => Promise<void>
 }) {
-  const [count, setCount] = useState(1)
+  // The bill amount the customer typed sets the count (1 per ₹1,000); staff can still change it.
+  const [count, setCount] = useState(() => Math.min(MAX_RELEASE, Math.max(1, eligibleVouchers(entry.billAmount ?? 0))))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const shop = shopById[entry.shopId]
@@ -129,6 +130,7 @@ function EntryRow({
           +91 {entry.phone.slice(0, 5)} {entry.phone.slice(5)}
           {entry.place && entry.place !== '—' ? ` · ${entry.place}` : ''}
           {entry.billNo ? ` · Bill ${entry.billNo}` : ''}
+          {entry.billAmount ? ` · ${inr(entry.billAmount)}` : ''}
         </p>
         <p className="text-xs text-muted">
           {admin && shop ? `${shop.shopNo} · ${shop.name} · ` : ''}

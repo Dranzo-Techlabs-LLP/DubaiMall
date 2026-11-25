@@ -67,10 +67,19 @@ STEP 4: CREATE THE SHOP LOGINS
 STEP 4b: SHOP QR CODES
   Each shop: "My QR & code" tab → "Download poster" → print it for the counter.
   The QR opens https://coupons.YOUR-DOMAIN/s/<shop>. The customer types their
-  name and WhatsApp number, staff type the 6-digit shop code shown in that tab,
-  and the customer appears under "Customers from QR" in the desk: pick the number
-  of vouchers → Release (opens WhatsApp). The mall admin sees every shop's QR in
-  the "QR codes" tab.
+  name, WhatsApp number and bill amount; staff check the bill and type the
+  6-digit shop code shown in that tab. The vouchers are made at once
+  (1 per full ₹1,000, the same rule as the desk) and the customer's phone shows
+  every coupon with a "Download coupons (PDF)" button. Refreshing or tapping
+  twice never makes extra vouchers. The vouchers appear in the desk's Customers
+  tab as "QR form (automatic)", where the shop can still Send them on WhatsApp.
+  Each shop picks what its form asks in "My QR & code" → Customer form:
+    Bill number             Required / Optional / Don't ask
+    Vouchers by bill amount on: the form asks the amount, 1 voucher per ₹1,000
+                            off (default): no amount field, 1 voucher per customer
+  A shop whose "Issue" right is off gets the old way instead: the customer waits
+  under "Customers from QR" and the shop releases the vouchers.
+  The mall admin sees every shop's QR in the "QR codes" tab.
 
 
 STEP 5: CHECK

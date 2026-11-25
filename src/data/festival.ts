@@ -1,12 +1,13 @@
+import { FESTIVAL } from '../../server/shared.mjs'
+
 // Festival dates confirmed 28 Oct 2026. Lucky-draw prizes still to be announced.
+// Name and labels live in server/shared.mjs, so coupons drawn by the server say the same.
 export const festival = {
-  name: 'Christmas & New Year Shopping Festival',
+  ...FESTIVAL,
   start: new Date('2026-12-01T10:00:00+05:30'),
   end: new Date('2027-01-04T22:00:00+05:30'),
-  dateLabel: '1 Dec 2026 – 4 Jan 2027',
   christmas: new Date('2026-12-25T00:00:00+05:30'),
   newYear: new Date('2027-01-01T00:00:00+05:30'),
-  drawLabel: "Mega lucky draw on New Year's Eve",
 }
 
 export type PickIcon = 'gift' | 'party' | 'cake' | 'phone' | 'sparkles' | 'camera'

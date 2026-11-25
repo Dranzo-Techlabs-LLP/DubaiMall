@@ -1,8 +1,10 @@
 // Coupon link server for the Dubai Mall Edakkara voucher desk.
 //
 // Also the voucher desk's backend: shop and admin logins, every shop's vouchers and sponsors,
-// and each shop's QR customer form (/s/<shop>): customers type their details on their own phone,
-// shop staff confirm with the shop's counter code, and the entry waits in the desk for vouchers.
+// and each shop's QR customer form (/s/<shop>): customers type their details and bill amount on
+// their own phone, shop staff confirm with the shop's counter code, and the vouchers are made at
+// once (1 per full ₹1,000, see shared.mjs). The customer lands on their coupon page with every
+// coupon and a PDF download. Shops without the "issue" right get the entry in the desk instead.
 // The desk uploads each coupon image here; the server stores it and returns a short
 // link (/c/<id>) for the WhatsApp greeting. The link opens a page with the coupon and a Download
 // button, and carries Open Graph tags so WhatsApp can show the coupon as a link preview.
@@ -18,6 +20,8 @@ import { createServer } from 'node:http'
 import { networkInterfaces } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { couponsPdf } from './pdf.mjs'
+import { FESTIVAL, MAX_VOUCHERS, RUPEES_PER_VOUCHER, eligibleVouchers } from './shared.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -47,7 +51,7 @@ const DESK_ORIGINS = (process.env.DESK_ORIGINS || 'http://localhost:5173')
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://${lanAddress()}:${PORT}`).replace(/\/+$/, '')
 
 const MAX_BODY = 6 * 1024 * 1024 // a coupon PNG is ~200 KB; sponsor logos up to 12 x 400 KB
-const MAX_CODES = 500
+const MAX_CODES = MAX_VOUCHERS
 const SESSION_DAYS = 14
 const ID_PATTERN = '[A-Za-z0-9_-]{12}'
 const COUPON_ID = new RegExp(`^${ID_PATTERN}$`)
@@ -116,6 +120,17 @@ function sqliteStore(DatabaseSync) {
   `)
   return {
     kind: `SQLite database ${file}`,
+    /** Runs the writes in fn as one transaction: all of them are saved, or none. */
+    atomically: (fn) => {
+      db.exec('begin')
+      try {
+        fn()
+        db.exec('commit')
+      } catch (err) {
+        db.exec('rollback')
+        throw err
+      }
+    },
     docsLoad: (col) => docAll.all(col).map((r) => JSON.parse(r.data)),
     docPut: (col, id, doc) => docUpsert.run(col, id, JSON.stringify(doc)),
     docDelete: (col, id) => docRemove.run(col, id),
@@ -146,6 +161,7 @@ function fileStore() {
   }
   return {
     kind: `files in ${dir}`,
+    atomically: (fn) => fn(), // each file is written whole (temp file + rename)
     docsLoad: (col) => {
       const d = join(DATA_DIR, 'docs', col)
       mkdirSync(d, { recursive: true })
@@ -274,6 +290,14 @@ function putDoc(col, doc) {
   docs[col].set(doc.id, doc)
   store.docPut(col, doc.id, doc)
 }
+/** Saves several documents together (one transaction in SQLite), then updates the memory copy. */
+function putDocs(list) {
+  for (const [col, doc] of list) if (!SAFE_ID.test(doc.id)) throw new Error(`Unsafe id for ${col}: ${doc.id}`)
+  store.atomically(() => {
+    for (const [col, doc] of list) store.docPut(col, doc.id, doc)
+  })
+  for (const [col, doc] of list) docs[col].set(doc.id, doc)
+}
 function deleteDoc(col, id) {
   docs[col].delete(id)
   store.docDelete(col, id)
@@ -360,7 +384,25 @@ function shopSettings(shopId, label) {
   putDoc('shopSettings', settings)
   return settings
 }
-const publicSettings = (s) => ({ shopId: s.id, label: s.label, code: s.code, codeSetAt: s.codeSetAt, entryUrl: entryUrlFor(s.id) })
+/**
+ * What each shop's QR form asks for, set by the shop (or the mall admin) in the desk:
+ *   billNo    'required' | 'optional' | 'off'  — the bill number field
+ *   byAmount  true: ask the bill amount and give 1 voucher per full ₹1,000; false: no amount field, 1 voucher
+ * Missing = bill number optional, 1 voucher per customer.
+ */
+const BILL_NO_MODES = ['required', 'optional', 'off']
+const formOptions = (s) => ({
+  billNo: BILL_NO_MODES.includes(s?.billNo) ? s.billNo : 'optional',
+  byAmount: s?.byAmount === true,
+})
+const publicSettings = (s) => ({
+  shopId: s.id,
+  label: s.label,
+  code: s.code,
+  codeSetAt: s.codeSetAt,
+  entryUrl: entryUrlFor(s.id),
+  ...formOptions(s),
+})
 /** The shop's form accepts entries while its QR is set up and its login (if any) may use it. */
 function formOpen(shopId) {
   const settings = docs.shopSettings.get(shopId)
@@ -385,6 +427,53 @@ function newCodes(count) {
   }
   return codes
 }
+/** A bill amount in rupees (up to 2 decimals), or null. */
+function parseAmount(raw) {
+  const s = String(raw ?? '').replace(/[₹,\s]/g, '').replace(/^rs\.?/i, '')
+  if (!/^\d{1,9}(\.\d{1,2})?$/.test(s)) return null
+  const amount = Number(s)
+  return amount > 0 ? amount : null
+}
+
+/**
+ * A new voucher (one purchase, one or more codes), used by the desk and by the QR form.
+ * Its coupon link is reserved now, so WhatsApp and the customer's screen can show it straight away;
+ * the desk may upload a coupon image to it later.
+ */
+function newIssue({ shopId, customerName, phone, place, billNo, count, issuedBy, billAmount, shopLabel, entryId, source }) {
+  // The voucher remembers the shop's sponsors at this moment, so later changes don't alter it.
+  const sponsors = docs.sponsors.get(shopId)?.list ?? []
+  const couponId = randomBytes(9).toString('base64url') // 12 characters, unguessable
+  return {
+    id: `iss-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`,
+    createdAt: new Date().toISOString(),
+    shopId,
+    customerName,
+    phone,
+    place: place || '—',
+    billNo: billNo || '',
+    codes: newCodes(count),
+    status: 'pending',
+    issuedBy,
+    couponId,
+    couponUrl: linkFor(couponId),
+    couponPending: true,
+    ...(billAmount ? { billAmount } : {}),
+    ...(shopLabel ? { shopLabel } : {}),
+    ...(source ? { source } : {}),
+    ...(entryId ? { entryId } : {}),
+    ...(sponsors.length ? { sponsorIds: sponsors.map((s) => s.id) } : {}),
+  }
+}
+const shopLabelOf = (issue) => issue.shopLabel || docs.shopSettings.get(issue.shopId)?.label || issue.shopId
+
+/** The voucher a coupon link belongs to: reserved links (couponId) and older uploaded ones. */
+function issueForCoupon(id) {
+  const tail = `/c/${id}`
+  for (const i of docs.issues.values()) if (i.couponId === id || i.couponUrl?.endsWith(tail)) return i
+  return undefined
+}
+
 /** The sponsors (logo + name) referenced by these vouchers, for drawing their coupons. */
 function sponsorsUsedBy(issues) {
   const used = {}
@@ -463,37 +552,35 @@ async function api(req, url, reply) {
     const entry = body.entryId ? docs.entries.get(String(body.entryId)) : undefined
     if (body.entryId && (!entry || !canSeeShop(user, entry.shopId))) return reply(404, { error: 'Customer entry not found' })
     if (entry && entry.status !== 'new') throw bad('Vouchers were already released for this customer')
-    if (entry) Object.assign(body, { shopId: entry.shopId, customerName: entry.customerName, phone: entry.phone, place: entry.place, billNo: entry.billNo })
+    if (entry) {
+      Object.assign(body, { shopId: entry.shopId, customerName: entry.customerName, phone: entry.phone, place: entry.place, billNo: entry.billNo })
+      if (entry.billAmount) body.billAmount = entry.billAmount
+    }
     const shopId = admin ? text(body.shopId, 40, 'shop') : user.shopId
     if (!SHOP_ID.test(shopId)) throw bad('Invalid shop')
     const phone = String(body.phone ?? '')
     if (!/^[6-9]\d{9}$/.test(phone)) throw bad('Invalid WhatsApp number')
     const count = Number(body.count)
     if (!Number.isInteger(count) || count < 1 || count > MAX_CODES) throw bad('Invalid number of vouchers')
-    // The voucher remembers the shop's sponsors at this moment, so later changes don't alter it.
-    const sponsors = docs.sponsors.get(shopId)?.list ?? []
-    // The coupon link is reserved now, so the desk can open WhatsApp straight away and upload the
-    // coupon image while the chat loads. Until the image arrives the link shows "being prepared".
-    const couponId = randomBytes(9).toString('base64url') // 12 characters, unguessable
-    const issue = {
-      id: `iss-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`,
-      createdAt: new Date().toISOString(),
+    const billAmount = body.billAmount === undefined || body.billAmount === null || body.billAmount === '' ? null : parseAmount(body.billAmount)
+    if (billAmount === null && body.billAmount) throw bad('Invalid bill amount')
+    const issue = newIssue({
       shopId,
       customerName: text(body.customerName, 100, 'customer name'),
       phone,
-      place: text(body.place, 60, 'place', { optional: true }) || '—',
+      place: text(body.place, 60, 'place', { optional: true }),
       billNo: text(body.billNo, 40, 'bill number', { optional: true }),
-      codes: newCodes(count),
-      status: 'pending',
+      count,
       issuedBy: user.id,
-      couponId,
-      couponUrl: linkFor(couponId),
-      couponPending: true,
-      ...(entry ? { entryId: entry.id } : {}),
-      ...(sponsors.length ? { sponsorIds: sponsors.map((s) => s.id) } : {}),
-    }
-    putDoc('issues', issue)
-    if (entry) putDoc('entries', { ...entry, status: 'issued', issueId: issue.id, handledAt: issue.createdAt, handledBy: user.id })
+      billAmount,
+      shopLabel: text(body.shopLabel, 120, 'shop name', { optional: true }) || docs.shopSettings.get(shopId)?.label,
+      entryId: entry?.id,
+      source: entry ? 'qr-release' : 'desk',
+    })
+    putDocs([
+      ['issues', issue],
+      ...(entry ? [['entries', { ...entry, status: 'issued', issueId: issue.id, handledAt: issue.createdAt, handledBy: user.id }]] : []),
+    ])
     console.log(`voucher ${issue.id} · ${shopId} · ${count} code(s) by ${user.id}`)
     return reply(201, { issue, sponsors: sponsorsUsedBy([issue]) })
   }
@@ -575,7 +662,7 @@ async function api(req, url, reply) {
   }
 
   // QR form settings: the shop's counter code and form address (created the first time).
-  if (method === 'POST' && (path === '/api/shop-settings' || path === '/api/shop-settings/new-code')) {
+  if (method === 'POST' && ['/api/shop-settings', '/api/shop-settings/new-code', '/api/shop-settings/options'].includes(path)) {
     if (!can(user, 'qr')) throw forbid('qr')
     const body = await readJson(req)
     const shopId = admin ? String(body.shopId ?? '') : user.shopId
@@ -584,6 +671,20 @@ async function api(req, url, reply) {
     if (path.endsWith('/new-code')) {
       settings = { ...settings, code: newCounterCode(), codeSetAt: new Date().toISOString() }
       putDoc('shopSettings', settings)
+    }
+    if (path.endsWith('/options')) {
+      const next = { ...settings }
+      if (body.billNo !== undefined) {
+        if (!BILL_NO_MODES.includes(body.billNo)) throw bad('Invalid bill number option')
+        next.billNo = body.billNo
+      }
+      if (body.byAmount !== undefined) {
+        if (typeof body.byAmount !== 'boolean') throw bad('Invalid bill amount option')
+        next.byAmount = body.byAmount
+      }
+      putDoc('shopSettings', next)
+      settings = next
+      console.log(`QR form options · ${shopId} · bill no. ${formOptions(next).billNo} · by amount ${formOptions(next).byAmount} (by ${user.id})`)
     }
     return reply(200, { settings: publicSettings(settings) })
   }
@@ -710,6 +811,7 @@ function couponPage(c) {
   .btn { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 52px; margin-top: 16px; border-radius: 14px;
          background: var(--gold); color: var(--ink); font-weight: 800; font-size: 17px; text-decoration: none; }
   .btn:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
+  .btn.alt { margin-top: 10px; background: #fff; border: 2px solid var(--ink); }
   .hint { margin: 10px 0 0; color: var(--muted); font-size: 14px; text-align: center; }
   h2 { margin: 28px 0 8px; font-size: 13px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
   ul { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; list-style: none; }
@@ -732,6 +834,10 @@ function couponPage(c) {
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0l-5-5m5 5l5-5M4 21h16"/></svg>
     Download coupon
   </a>
+  <a class="btn alt" href="/c/${c.id}.pdf" download="${escapeHtml(pdfFileName({ codes }))}">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 14h6M9 18h4"/></svg>
+    Download all coupons (PDF)
+  </a>
   <p class="hint">Or press and hold the coupon to save it to your photos.</p>
   <h2>Your voucher code${n === 1 ? '' : 's'}</h2>
   <ul>${codes.map((code) => `<li>${escapeHtml(code)}</li>`).join('')}</ul>
@@ -742,23 +848,214 @@ function couponPage(c) {
 </html>`
 }
 
+// The coupon page's only script: draws the coupons as PNG pictures on the phone (up to 10 per picture)
+// for "Save to gallery". iPhone: the share sheet's "Save Image" puts them in Photos. Elsewhere: the
+// picture downloads (Android shows it in the gallery's Download album). The page allows this script by its hash.
+const GALLERY_SCRIPT = `(function(){
+var el=document.getElementById('coupon-data'),btn=document.getElementById('save-gallery'),hint=document.getElementById('gallery-hint');
+if(!el||!btn||!document.createElement('canvas').toBlob)return;
+var d=JSON.parse(el.textContent),W=1000,H=400,GAP=28,PAD=32,PER=10,files=null;
+var ios=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+function rr(c,x,y,w,h,r){c.beginPath();c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,y+h,r);c.arcTo(x+w,y+h,x,y+h,r);c.arcTo(x,y+h,x,y,r);c.arcTo(x,y,x+w,y,r);c.closePath()}
+function fit(c,t,max){t=String(t);if(c.measureText(t).width<=max)return t;while(t.length>1&&c.measureText(t+'…').width>max)t=t.slice(0,-1);return t+'…'}
+function ticket(c,x,y,code,i,n){
+var stub=120,body=W-stub,L=x+44,max=body-88,col=max/2;
+c.save();rr(c,x,y,W,H,24);c.clip();c.fillStyle='#0e1838';c.fillRect(x,y,body,H);
+var g=c.createLinearGradient(0,y,0,y+H);g.addColorStop(0,'#e9b949');g.addColorStop(1,'#cf9a2e');c.fillStyle=g;c.fillRect(x+body,y,stub,H);c.restore();
+c.strokeStyle='rgba(255,255,255,.45)';c.lineWidth=3;c.setLineDash([10,10]);c.beginPath();c.moveTo(x+body,y+20);c.lineTo(x+body,y+H-20);c.stroke();c.setLineDash([]);
+c.fillStyle='#faf7f2';c.beginPath();c.arc(x+body,y,16,0,Math.PI*2);c.fill();c.beginPath();c.arc(x+body,y+H,16,0,Math.PI*2);c.fill();
+c.textAlign='left';c.fillStyle='#e9b949';c.font='800 22px system-ui,sans-serif';c.fillText('DUBAI MALL EDAKKARA',L,y+62);
+c.textAlign='right';c.fillStyle='rgba(255,255,255,.6)';c.font='700 22px system-ui,sans-serif';c.fillText('Voucher '+i+' of '+n,x+body-44,y+62);c.textAlign='left';
+c.fillStyle='#fff';c.font='600 34px Georgia,serif';c.fillText(fit(c,d.festival,max),L,y+108);
+c.font='700 52px ui-monospace,Consolas,"Courier New",monospace';var cw=c.measureText(code).width+56;
+rr(c,L,y+136,cw,84,14);c.fillStyle='rgba(233,185,73,.12)';c.fill();c.strokeStyle='rgba(233,185,73,.6)';c.lineWidth=2;c.stroke();
+c.fillStyle='#e9b949';c.fillText(code,L+28,y+196);
+c.font='600 20px system-ui,sans-serif';c.fillStyle='rgba(255,255,255,.6)';c.fillText('Issued to',L,y+262);c.fillText('Shop',L+col,y+262);
+c.font='700 26px system-ui,sans-serif';c.fillStyle='#fff';c.fillText(fit(c,d.customer,col-24),L,y+296);c.fillText(fit(c,d.shop,col-24),L+col,y+296);
+c.font='600 20px system-ui,sans-serif';c.fillStyle='rgba(255,255,255,.6)';c.fillText('Valid',L,y+336);
+c.font='700 24px system-ui,sans-serif';c.fillStyle='#fff';c.fillText(fit(c,d.valid,max),L,y+370);
+c.save();c.translate(x+body+stub/2,y+H/2);c.rotate(-Math.PI/2);c.fillStyle='#0e1838';c.font='800 30px system-ui,sans-serif';c.textAlign='center';c.fillText('L U C K Y   D R A W',0,10);c.restore()}
+function picture(codes,start){var n=codes.length,cv=document.createElement('canvas');cv.width=W+PAD*2;cv.height=PAD*2+n*H+(n-1)*GAP;
+var c=cv.getContext('2d');c.fillStyle='#faf7f2';c.fillRect(0,0,cv.width,cv.height);
+codes.forEach(function(code,k){ticket(c,PAD,PAD+k*(H+GAP),code,start+k+1,d.codes.length)});
+return new Promise(function(ok){cv.toBlob(ok,'image/png')})}
+var jobs=[];for(var s=0;s<d.codes.length;s+=PER)(function(s){jobs.push(picture(d.codes.slice(s,s+PER),s).then(function(b){
+return new File([b],d.file+(d.codes.length>PER?'-'+(s/PER+1):'')+'.png',{type:'image/png'})}))})(s);
+Promise.all(jobs).then(function(f){files=f;btn.hidden=false;if(hint){hint.hidden=false;hint.textContent=ios?'Tap “Save to gallery”, then “Save Image” to add your coupons to Photos.':'The picture saves to your phone and shows in the gallery (Download folder).'}});
+btn.addEventListener('click',function(){if(!files)return;
+if(ios&&navigator.canShare&&navigator.canShare({files:files})){navigator.share({files:files}).catch(function(){});return}
+files.forEach(function(f,k){setTimeout(function(){var a=document.createElement('a'),u=URL.createObjectURL(f);a.href=u;a.download=f.name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(u)},10000)},k*700)})})
+})()`
+const GALLERY_SCRIPT_HASH = createHash('sha256').update(GALLERY_SCRIPT).digest('base64')
+const CODES_CSP = `default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'sha256-${GALLERY_SCRIPT_HASH}'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`
+
+/** What the PDF prints for a voucher. */
+function pdfDataFor(issue) {
+  return {
+    codes: issue.codes,
+    customer: issue.customerName,
+    shop: shopLabelOf(issue),
+    billAmount: issue.billAmount,
+    billNo: issue.billNo,
+    sponsors: (issue.sponsorIds ?? []).map((sid) => docs.sponsorLib.get(sid)?.name).filter(Boolean),
+    festival: FESTIVAL.name,
+    dateLabel: FESTIVAL.dateLabel,
+    drawLabel: FESTIVAL.drawLabel,
+  }
+}
+
+const inr = (n) => `₹${Number(n).toLocaleString('en-IN')}`
+const pdfFileName = (issue) => `dubai-mall-coupons-${issue.codes[0] ?? 'voucher'}.pdf`
+
+/**
+ * The customer's coupons drawn from the saved voucher: one ticket per code, the total,
+ * and the PDF download. `fresh` adds the "submitted" message right after the QR form.
+ */
+function codesPage(issue, id, fresh) {
+  const codes = issue.codes
+  const n = codes.length
+  const shop = shopLabelOf(issue)
+  const sponsors = (issue.sponsorIds ?? []).map((sid) => docs.sponsorLib.get(sid)).filter(Boolean)
+  const plural = n === 1 ? '' : 's'
+  const tickets = codes
+    .map(
+      (code, i) => `<li class="ticket">
+      <div class="body">
+        <p class="brand"><span>Dubai Mall Edakkara</span><span>Voucher ${i + 1} of ${n}</span></p>
+        <p class="fest">${escapeHtml(FESTIVAL.name)}</p>
+        <p class="code">${escapeHtml(code)}</p>
+        <dl>
+          <div><dt>Issued to</dt><dd>${escapeHtml(issue.customerName)}</dd></div>
+          <div><dt>Shop</dt><dd>${escapeHtml(shop)}</dd></div>
+          <div class="wide"><dt>Valid</dt><dd>${escapeHtml(FESTIVAL.dateLabel)} · ${escapeHtml(FESTIVAL.drawLabel)}</dd></div>
+        </dl>
+      </div>
+      <div class="stub" aria-hidden="true"><span>Lucky draw</span></div>
+    </li>`,
+    )
+    .join('\n    ')
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#0E1838">
+<title>Your lucky-draw coupons — Dubai Mall Edakkara</title>
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Dubai Mall Edakkara">
+<meta property="og:title" content="Your lucky-draw coupons — Dubai Mall Edakkara">
+<meta property="og:description" content="${n} lucky-draw voucher${plural} for ${escapeHtml(issue.customerName)}. Tap to view and download your coupons.">
+<style>
+  :root { --ink: #0e1838; --gold: #e9b949; --gold-text: #7a520c; --ivory: #faf7f2; --muted: #565d73; --line: #e3ddd2; --green: #1f6e43; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--ivory); color: var(--ink); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { background: var(--ink); color: #fff; padding: 20px 16px 56px; text-align: center; }
+  .eyebrow { margin: 0; color: var(--gold); font-size: 12px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
+  h1 { margin: 6px auto 0; max-width: 560px; font: 600 clamp(22px, 6vw, 30px)/1.25 Georgia, "Times New Roman", serif; }
+  .sub { margin: 6px auto 0; max-width: 560px; color: rgb(255 255 255 / .75); font-size: 15px; }
+  main { max-width: 640px; margin: -40px auto 0; padding: 0 16px 40px; }
+  .done { display: flex; gap: 12px; align-items: flex-start; margin: 0 0 14px; padding: 14px 16px; border-radius: 16px; background: #e3f4ea; color: var(--green); box-shadow: 0 10px 28px -14px rgb(14 24 56 / .35); }
+  .done b { display: block; font-size: 17px; }
+  .done span { color: #2b5b40; font-size: 14px; }
+  .done .tick { flex: none; display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; background: var(--green); color: #fff; font-size: 18px; font-weight: 800; }
+  .summary { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; margin: 0 0 14px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 16px; background: #fff; }
+  .summary div { min-width: 0; }
+  .summary dt { color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+  .summary dd { margin: 0; font-weight: 800; font-size: 18px; }
+  .tickets { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; }
+  .ticket { display: flex; overflow: hidden; border-radius: 16px; background: var(--ink); color: #fff; box-shadow: 0 14px 36px -16px rgb(14 24 56 / .55); }
+  .ticket .body { flex: 1; min-width: 0; padding: 16px 18px; }
+  .ticket p { margin: 0; }
+  .brand { display: flex; justify-content: space-between; gap: 8px; color: var(--gold); font-size: 11px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; }
+  .brand span:last-child { color: rgb(255 255 255 / .6); letter-spacing: .04em; white-space: nowrap; }
+  .fest { margin-top: 2px !important; font: 600 16px/1.3 Georgia, "Times New Roman", serif; }
+  .code { display: inline-block; margin-top: 12px !important; padding: 6px 12px; border: 1px solid rgb(233 185 73 / .5); border-radius: 10px; background: rgb(233 185 73 / .1); color: var(--gold); font: 700 clamp(19px, 6vw, 24px)/1.2 ui-monospace, Consolas, "Courier New", monospace; letter-spacing: .12em; }
+  .ticket dl { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; margin: 12px 0 0; font-size: 13px; }
+  .ticket dt { color: rgb(255 255 255 / .6); }
+  .ticket dd { margin: 0; font-weight: 700; overflow-wrap: anywhere; }
+  .ticket .wide { grid-column: 1 / -1; }
+  .stub { flex: none; display: grid; place-items: center; width: 50px; border-left: 2px dashed rgb(255 255 255 / .35); background: linear-gradient(var(--gold), #cf9a2e); color: var(--ink); }
+  .stub span { writing-mode: vertical-rl; transform: rotate(180deg); font-size: 12px; font-weight: 800; letter-spacing: .22em; text-transform: uppercase; }
+  .btn { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 52px; margin: 0 0 16px; border-radius: 14px; background: var(--gold); color: var(--ink); font-weight: 800; font-size: 17px; text-decoration: none; }
+  .btn:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
+  .btn.alt { width: 100%; margin-top: -6px; border: 2px solid var(--ink); background: #fff; font: 800 17px system-ui, sans-serif; cursor: pointer; }
+  [hidden] { display: none !important; }
+  .hint.top { margin: -6px 0 16px; }
+  .bottom { margin: 16px 0 0; }
+  .hint { margin: 10px 0 0; color: var(--muted); font-size: 14px; text-align: center; }
+  .sponsors { margin: 18px 0 0; padding: 14px 16px; border: 1px solid var(--line); border-radius: 16px; background: #fff; }
+  .sponsors h2 { margin: 0 0 10px; color: var(--muted); font-size: 12px; letter-spacing: .14em; text-transform: uppercase; }
+  .sponsors ul { display: flex; flex-wrap: wrap; gap: 14px; margin: 0; padding: 0; list-style: none; }
+  .sponsors li { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 96px; text-align: center; font-size: 12px; font-weight: 700; }
+  .sponsors img { height: 48px; width: auto; max-width: 96px; object-fit: contain; }
+  .draw { margin: 18px 0 0; padding: 12px 14px; border-radius: 12px; background: #f7ead0; color: var(--gold-text); font-weight: 700; }
+  footer { margin-top: 24px; color: var(--muted); font-size: 13px; text-align: center; }
+  @media (max-width: 380px) { .ticket dl { grid-template-columns: 1fr; } .stub { width: 40px; } }
+  @media print { header, .btn, .hint, .done { display: none; } main { margin: 0; } .ticket { break-inside: avoid; box-shadow: none; } }
+</style>
+</head>
+<body>
+<header>
+  <p class="eyebrow">Dubai Mall Edakkara</p>
+  <h1>${fresh ? 'Thank you' : 'Merry Christmas &amp; Happy New Year'}, ${escapeHtml(issue.customerName)}!</h1>
+  <p class="sub">Your ${n} lucky-draw coupon${plural} from ${escapeHtml(shop)}</p>
+</header>
+<main>
+  ${
+    fresh
+      ? `<p class="done" role="status"><span class="tick" aria-hidden="true">✓</span><span><b>Submitted. ${n} coupon${plural} generated.</b>
+    <span>Download them now, or come back to this page any time. Refreshing it won’t make new coupons.</span></span></p>`
+      : ''
+  }
+  <dl class="summary">
+    <div><dt>Coupons</dt><dd>${n}</dd></div>
+    ${issue.billAmount ? `<div><dt>Bill amount</dt><dd>${inr(issue.billAmount)}</dd></div>` : ''}
+    ${issue.billAmount ? `<div><dt>Rule</dt><dd>1 per ${inr(RUPEES_PER_VOUCHER)}</dd></div>` : ''}
+  </dl>
+  <a class="btn" href="/c/${id}.pdf" download="${pdfFileName(issue)}">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0l-5-5m5 5l5-5M4 21h16"/></svg>
+    Download coupons (PDF)
+  </a>
+  <button type="button" class="btn alt" id="save-gallery" hidden>
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="M21 15l-5-5L5 21"/></svg>
+    Save to gallery
+  </button>
+  <p class="hint top" id="gallery-hint" hidden></p>
+  <ul class="tickets" aria-label="Your lucky-draw coupons">
+    ${tickets}
+  </ul>
+  ${
+    sponsors.length
+      ? `<section class="sponsors"><h2>Sponsored by</h2><ul>${sponsors
+          .map((s) => `<li><img src="${escapeHtml(s.image)}" alt="">${escapeHtml(s.name)}</li>`)
+          .join('')}</ul></section>`
+      : ''
+  }
+  <p class="draw">${escapeHtml(FESTIVAL.drawLabel)}. Keep ${n === 1 ? 'this coupon' : 'these coupons'} to claim your prize.</p>
+  ${n > 3 ? `<a class="btn bottom" href="/c/${id}.pdf" download="${pdfFileName(issue)}">Download all ${n} coupons (PDF)</a>` : ''}
+  <p class="hint">Save this page’s link to see your coupons again.</p>
+  <footer>Wishing you and your family a joyful season! — Dubai Mall Edakkara</footer>
+</main>
+<script type="application/json" id="coupon-data">${JSON.stringify({
+    codes,
+    customer: issue.customerName,
+    shop,
+    festival: FESTIVAL.name,
+    valid: `${FESTIVAL.dateLabel} · ${FESTIVAL.drawLabel}`,
+    file: pdfFileName(issue).replace(/[.]pdf$/, ''),
+  }).replace(/</g, '\\u003c')}</script>
+<script>${GALLERY_SCRIPT}</script>
+</body>
+</html>`
+}
+
 const notFoundPage = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Coupon not found</title></head>
 <body style="font:16px/1.5 system-ui,sans-serif;margin:0;padding:48px 16px;text-align:center;background:#faf7f2;color:#0e1838">
 <h1 style="font:600 24px Georgia,serif">Coupon not found</h1><p>Please check the link in your WhatsApp message, or ask at the Dubai Mall Edakkara counter.</p></body></html>`
 
-// Shown when the customer opens the link before the desk has finished uploading the image; reloads itself.
-const preparingPage = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><meta http-equiv="refresh" content="3"><title>Your coupon is on its way</title></head>
-<body style="font:16px/1.5 system-ui,sans-serif;margin:0;padding:48px 16px;text-align:center;background:#faf7f2;color:#0e1838">
-<h1 style="font:600 24px Georgia,serif">Your coupon is on its way</h1><p>It will appear here in a few seconds.</p></body></html>`
-
-/** True when a voucher has reserved this coupon link but its image isn't uploaded yet. */
-const couponIsPending = (id) => {
-  for (const i of docs.issues.values()) if (i.couponId === id) return Boolean(i.couponPending)
-  return false
-}
-
-const PAGE_CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-const FORM_CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+const PAGE_CSP = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+const formCsp = () => `default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-${FORM_SCRIPT_HASH}'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`
 
 // ---------- QR customer form (/s/<shop>) ----------
 
@@ -794,6 +1091,8 @@ const pageShell = (title, body) => `<!doctype html>
   .staff input { letter-spacing: .3em; font-weight: 800; text-align: center; font-size: 20px; }
   button { width: 100%; min-height: 52px; margin-top: 20px; border: 0; border-radius: 14px; background: var(--gold); color: var(--ink); font: 800 17px system-ui, sans-serif; cursor: pointer; }
   button:focus-visible, a:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
+  .calc { margin: 6px 0 0; font-size: 14px; font-weight: 700; color: var(--green); }
+  button:disabled { opacity: .75; cursor: progress; }
   .error { margin: 0 0 14px; padding: 10px 12px; border-radius: 12px; background: #fbe4e8; color: var(--red); font-weight: 700; font-size: 15px; }
   .ok { text-align: center; }
   .ok .tick { display: inline-grid; place-items: center; width: 56px; height: 56px; border-radius: 50%; background: #e3f4ea; color: var(--green); font-size: 30px; font-weight: 800; }
@@ -808,38 +1107,85 @@ ${body}
 </body>
 </html>`
 
+/** Vouchers are made as soon as the form is sent, unless the mall office took the shop's "issue" right away. */
+function autoIssueFor(shopId) {
+  const login = docs.users.get(shopId)
+  return !login || can(login, 'issue')
+}
+
+/** One per form shown: a second submit with the same token returns the first result instead of new vouchers. */
+const FORM_TOKEN = /^[A-Za-z0-9_-]{16}$/
+const newFormToken = () => randomBytes(12).toString('base64url')
+const entryByToken = (token) => {
+  for (const e of docs.entries.values()) if (e.formToken === token) return e
+  return undefined
+}
+
+// The form's only script: shows how many vouchers the bill earns, and stops a second tap on Submit.
+// The page's Content-Security-Policy allows exactly this script, by its hash.
+const FORM_SCRIPT = `(function(){var f=document.querySelector('form.entry');if(!f)return;var a=f.elements.amount,o=document.getElementById('calc'),b=f.querySelector('button[type=submit]');
+function show(){if(!a||!o)return;var v=Number(String(a.value).replace(/[^0-9.]/g,''));var n=v>0?Math.floor(v/${RUPEES_PER_VOUCHER}):0;
+o.textContent=n>${MAX_VOUCHERS}?'That is more than ${MAX_VOUCHERS} vouchers. Please ask the shop.':n>0?'You get '+n+' lucky-draw voucher'+(n===1?'':'s'):'1 lucky-draw voucher for every ₹${RUPEES_PER_VOUCHER.toLocaleString('en-IN')} on the bill'}
+if(a){a.addEventListener('input',show);show()}
+f.addEventListener('submit',function(e){if(f.getAttribute('data-busy')){e.preventDefault();return}f.setAttribute('data-busy','1');b.disabled=true;b.textContent=b.getAttribute('data-busy-text')})})()`
+const FORM_SCRIPT_HASH = createHash('sha256').update(FORM_SCRIPT).digest('base64')
+
 function entryFormPage(shopId, settings, values = {}, error = '') {
   const v = (k) => escapeHtml(values[k] ?? '')
+  const auto = autoIssueFor(shopId)
+  const token = FORM_TOKEN.test(values.token ?? '') ? values.token : newFormToken()
+  const perVoucher = `₹${RUPEES_PER_VOUCHER.toLocaleString('en-IN')}`
+  const opts = formOptions(settings)
+  // Several coupons only when the shop gives them by bill amount; otherwise each customer gets one.
+  const many = auto && opts.byAmount
+  const amountField = opts.byAmount
+    ? `<label>Bill amount
+      <span class="phone"><span>₹</span><input name="amount" value="${v('amount')}" required inputmode="decimal" autocomplete="off" maxlength="14" placeholder="e.g. 2500" aria-describedby="calc"></span>
+    </label>
+    <p class="calc" id="calc" aria-live="polite">1 lucky-draw voucher for every ${perVoucher} on the bill</p>`
+    : ''
+  const billNoField =
+    opts.billNo === 'off'
+      ? ''
+      : `<label>Bill number${opts.billNo === 'required' ? '' : ' <span class="opt">Optional</span>'}
+      <input name="billNo" value="${v('billNo')}" maxlength="40"${opts.billNo === 'required' ? ' required' : ''}>
+    </label>`
+  const check = [opts.byAmount && 'bill amount', opts.billNo === 'required' && 'bill number'].filter(Boolean).join(' and ')
   return pageShell(`Lucky-draw coupon — ${settings.label}`, `<header>
   <p class="eyebrow">Dubai Mall Edakkara · Lucky draw</p>
-  <h1>Get your lucky-draw coupon</h1>
+  <h1>Get your lucky-draw coupon${many ? 's' : ''}</h1>
   <p class="sub">${escapeHtml(settings.label)}</p>
 </header>
 <main>
-  <form class="card" method="post" action="/s/${shopId}" autocomplete="on">
+  <form class="card entry" method="post" action="/s/${shopId}" autocomplete="on">
     ${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ''}
+    <input type="hidden" name="token" value="${token}">
     <label>Your name
       <input name="name" value="${v('name')}" required maxlength="100" autocomplete="name">
     </label>
     <label>WhatsApp number
       <span class="phone"><span>+91</span><input name="phone" value="${v('phone')}" required inputmode="tel" autocomplete="tel-national" placeholder="98470 12345"></span>
     </label>
+    ${amountField}
     <label>Place <span class="opt">Optional</span>
       <input name="place" value="${v('place')}" maxlength="60" placeholder="e.g. Edakkara">
     </label>
-    <label>Bill number <span class="opt">Optional</span>
-      <input name="billNo" value="${v('billNo')}" maxlength="40">
-    </label>
+    ${billNoField}
     <div class="staff">
       <p>For shop staff</p>
-      <label>Shop code
+      <label>${check ? `Check the ${check}, then type the shop code` : 'Type the shop code'}
         <input name="code" required inputmode="numeric" autocomplete="off" maxlength="6" pattern="[0-9]{6}" placeholder="••••••">
       </label>
     </div>
-    <button type="submit">Submit</button>
+    <button type="submit" data-busy-text="${auto ? `Generating your coupon${many ? 's' : ''}…` : 'Sending…'}">${auto ? `Get my coupon${many ? 's' : ''}` : 'Submit'}</button>
   </form>
-  <footer>Your coupon arrives on WhatsApp from the shop. Your number is used only for this lucky draw.</footer>
-</main>`)
+  <footer>${
+    auto
+      ? `Your coupon${many ? 's appear' : ' appears'} on this screen as soon as you submit, ready to download. Your number is used only for this lucky draw.`
+      : 'Your coupon arrives on WhatsApp from the shop. Your number is used only for this lucky draw.'
+  }</footer>
+</main>
+<script>${FORM_SCRIPT}</script>`)
 }
 
 const entryThanksPage = (shopId, settings, name) =>
@@ -869,13 +1215,39 @@ const normalisePhone = (raw) => {
 }
 
 /** A customer's details from the shop's QR form, confirmed with the shop's counter code. */
+/**
+ * A customer's details and bill amount from the shop's QR form, confirmed with the shop's counter code.
+ * Returns { redirect } to the customer's coupon page once the vouchers are made, or { page, status }.
+ */
 async function submitEntry(req, shopId, settings) {
   const form = new URLSearchParams((await readBody(req)).toString('utf8'))
-  const values = Object.fromEntries(['name', 'phone', 'place', 'billNo'].map((k) => [k, (form.get(k) ?? '').trim()]))
-  const fail = (error) => ({ page: entryFormPage(shopId, settings, values, error), status: 400 })
+  const values = Object.fromEntries(['name', 'phone', 'amount', 'place', 'billNo', 'token'].map((k) => [k, (form.get(k) ?? '').trim()]))
+  if (!FORM_TOKEN.test(values.token)) values.token = newFormToken()
+  const fail = (error, status = 400) => ({ page: entryFormPage(shopId, settings, values, error), status })
+
+  // Sent before (a second tap on Submit, a refresh, a retry after the connection dropped): same result, nothing new.
+  const earlier = entryByToken(values.token)
+  if (earlier) return resultFor(earlier, shopId, settings)
+
   if (!values.name || values.name.length > 100) return fail('Please enter your name.')
   const phone = normalisePhone(values.phone)
   if (!phone) return fail('Please enter a 10-digit WhatsApp number.')
+  // The shop's own form options decide which fields count (a field the form doesn't show is ignored).
+  const opts = formOptions(settings)
+  let billAmount = null
+  let count = 1 // without "vouchers by bill amount", every customer gets one voucher
+  if (opts.byAmount) {
+    billAmount = parseAmount(values.amount)
+    if (!billAmount) return fail('Please enter the bill amount in rupees, for example 2500.')
+    count = eligibleVouchers(billAmount)
+    const perVoucher = `₹${RUPEES_PER_VOUCHER.toLocaleString('en-IN')}`
+    if (count < 1) return fail(`The bill must be at least ${perVoucher} for a lucky-draw voucher (1 voucher for every ${perVoucher}).`)
+    if (count > MAX_VOUCHERS) return fail(`That bill is more than ${MAX_VOUCHERS} vouchers. Please ask the shop to issue them from the voucher desk.`)
+  } else {
+    values.amount = ''
+  }
+  if (opts.billNo === 'off') values.billNo = ''
+  if (opts.billNo === 'required' && !values.billNo) return fail('Please enter the bill number.')
   if (values.place.length > 60 || values.billNo.length > 40) return fail('Place or bill number is too long.')
   const key = `entry|${req.headers['x-forwarded-for'] || req.socket.remoteAddress}|${shopId}`
   if (throttled(key)) return { page: entryFormPage(shopId, settings, values, 'Too many wrong shop codes. Try again in 15 minutes.'), status: 429 }
@@ -886,24 +1258,51 @@ async function submitEntry(req, shopId, settings) {
     return fail('Wrong shop code. Shop staff: check the code in the voucher desk.')
   }
   failures.delete(key)
-  // The same customer submitting twice before the shop acts updates one entry instead of adding another.
-  const waiting = [...docs.entries.values()].find((e) => e.shopId === shopId && e.phone === phone && e.status === 'new')
-  const entry = {
-    ...(waiting ?? { id: `ent-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`, shopId, status: 'new' }),
-    createdAt: new Date().toISOString(),
-    customerName: values.name,
-    phone,
-    place: values.place || '—',
-    billNo: values.billNo,
+
+  const now = new Date().toISOString()
+  const details = { customerName: values.name, phone, place: values.place || '—', billNo: values.billNo, ...(billAmount ? { billAmount } : {}) }
+  try {
+    if (!autoIssueFor(shopId)) {
+      // This shop releases vouchers from the desk: the entry waits there, with its bill amount.
+      // The same customer submitting twice before the shop acts updates one entry instead of adding another.
+      const waiting = [...docs.entries.values()].find((e) => e.shopId === shopId && e.phone === phone && e.status === 'new')
+      const entry = {
+        ...(waiting ?? { id: `ent-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`, shopId, status: 'new' }),
+        createdAt: now,
+        formToken: values.token,
+        ...details,
+      }
+      putDoc('entries', entry)
+      console.log(`QR entry ${entry.id} · ${shopId} · ${entry.customerName} · waits for the shop`)
+      return resultFor(entry, shopId, settings)
+    }
+
+    // Vouchers right away: the entry and its vouchers are saved together, or not at all.
+    const entryId = `ent-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
+    const issue = newIssue({ shopId, ...details, count, issuedBy: 'qr-form', shopLabel: settings.label, entryId, source: 'qr-form' })
+    const entry = { id: entryId, shopId, createdAt: now, formToken: values.token, ...details, status: 'issued', issueId: issue.id, handledAt: now, handledBy: 'qr-form' }
+    putDocs([
+      ['issues', issue],
+      ['entries', entry],
+    ])
+    console.log(`QR entry ${entry.id} · ${shopId} · ${entry.customerName} · ${billAmount ? `₹${billAmount} → ` : ''}${count} voucher(s) ${issue.id}`)
+    return resultFor(entry, shopId, settings)
+  } catch (err) {
+    console.error(err)
+    return fail('Something went wrong while saving. Nothing was saved, so please press the button again.', 500)
   }
-  putDoc('entries', entry)
-  console.log(`QR entry ${entry.id} · ${shopId} · ${entry.customerName}`)
-  return { page: entryThanksPage(shopId, settings, values.name), status: 200 }
+}
+
+/** Where a submitted form leads: the customer's coupon page, or the thank-you page while the shop releases them. */
+function resultFor(entry, shopId, settings) {
+  const issue = entry.issueId ? docs.issues.get(entry.issueId) : undefined
+  if (issue?.couponId) return { redirect: `/c/${issue.couponId}?new=1` }
+  return { page: entryThanksPage(shopId, settings, entry.customerName), status: 200 }
 }
 
 // ---------- routes ----------
 
-const couponRoute = new RegExp(`^/c/(${ID_PATTERN})(\\.png)?$`)
+const couponRoute = new RegExp(`^/c/(${ID_PATTERN})(\\.png|\\.pdf)?$`)
 
 async function handle(req, res) {
   const url = new URL(req.url ?? '/', 'http://local')
@@ -917,12 +1316,14 @@ async function handle(req, res) {
   const formRoute = /^\/s\/([a-z0-9][a-z0-9-]{1,39})$/.exec(url.pathname)
   if (formRoute) {
     const shopId = formRoute[1]
-    const html = { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': FORM_CSP, 'Cache-Control': 'no-store' }
+    const html = { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': formCsp(), 'Cache-Control': 'no-store' }
     if (!formOpen(shopId)) return send(res, 404, formClosedPage, html)
     const settings = docs.shopSettings.get(shopId)
     if (req.method === 'POST') {
-      const { page, status } = await submitEntry(req, shopId, settings)
-      return send(res, status, page, html)
+      const result = await submitEntry(req, shopId, settings)
+      // Post/Redirect/Get: refreshing the coupon page never sends the form again.
+      if (result.redirect) return send(res, 303, '', { Location: result.redirect, 'Cache-Control': 'no-store' })
+      return send(res, result.status, result.page, html)
     }
     if (req.method === 'GET' || req.method === 'HEAD') return send(res, 200, req.method === 'HEAD' ? '' : entryFormPage(shopId, settings), html)
   }
@@ -933,16 +1334,38 @@ async function handle(req, res) {
 
   const match = couponRoute.exec(url.pathname)
   if (match) {
-    const coupon = store.get(match[1])
-    if (!coupon && !match[2] && couponIsPending(match[1])) {
-      return send(res, 200, req.method === 'HEAD' ? '' : preparingPage, {
+    const [, id, ext] = match
+    const notFound = () => send(res, 404, notFoundPage, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': PAGE_CSP })
+
+    // Every voucher of the purchase as its own printable coupon.
+    if (ext === '.pdf') {
+      const issue = issueForCoupon(id)
+      if (!issue) return notFound()
+      const pdf = couponsPdf(pdfDataFor(issue))
+      return send(res, 200, req.method === 'HEAD' ? '' : pdf, {
+        // Sent as a plain file, not application/pdf: phone browsers (iPhone Safari, WhatsApp's own
+        // browser) open PDFs in a viewer even when asked to download; a plain file can only be saved.
+        // The .pdf name makes it open as a PDF once it's on the phone.
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(pdf.byteLength),
+        'Content-Disposition': `attachment; filename="${pdfFileName(issue)}"`,
+        'X-Download-Options': 'noopen',
+        'Cache-Control': 'private, max-age=300',
+      })
+    }
+
+    const coupon = store.get(id)
+    if (!coupon) {
+      // No coupon image (yet): the codes page, drawn here from the saved voucher.
+      const issue = ext ? undefined : issueForCoupon(id)
+      if (!issue) return notFound()
+      return send(res, 200, req.method === 'HEAD' ? '' : codesPage(issue, id, url.searchParams.has('new')), {
         'Content-Type': 'text/html; charset=utf-8',
-        'Content-Security-Policy': PAGE_CSP,
+        'Content-Security-Policy': CODES_CSP,
         'Cache-Control': 'no-store',
       })
     }
-    if (!coupon) return send(res, 404, notFoundPage, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': PAGE_CSP })
-    if (match[2]) {
+    if (ext === '.png') {
       const headers = {
         'Content-Type': 'image/png',
         'Content-Length': String(coupon.png.byteLength),

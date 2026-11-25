@@ -25,7 +25,7 @@ console.log('\n2/4  Assembling the package')
 rmSync(out, { recursive: true, force: true })
 mkdirSync(join(pkg, 'coupon-server'), { recursive: true })
 cpSync(join(root, 'dist'), join(pkg, 'site'), { recursive: true })
-for (const f of ['index.mjs', 'app.js', 'package.json', '.env.example']) {
+for (const f of ['index.mjs', 'shared.mjs', 'pdf.mjs', 'app.js', 'package.json', '.env.example']) {
   cpSync(join(root, 'server', f), join(pkg, 'coupon-server', f))
 }
 // Shell script and readme must have Unix line endings to run on the Linux server.

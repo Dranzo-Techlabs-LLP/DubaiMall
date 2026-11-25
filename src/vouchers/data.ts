@@ -1,11 +1,8 @@
 import { categories, shops, type Shop } from '../data/shops'
 import { festival } from '../data/festival'
 
-/** One lucky-draw voucher for every full ₹1,000 on the bill. */
-export const RUPEES_PER_VOUCHER = 1000
-
-export const eligibleVouchers = (amount: number) =>
-  Number.isFinite(amount) && amount > 0 ? Math.floor(amount / RUPEES_PER_VOUCHER) : 0
+// 1 voucher per full ₹1,000: the same rule the server uses for the QR form (server/shared.mjs).
+export { RUPEES_PER_VOUCHER, eligibleVouchers } from '../../server/shared.mjs'
 
 // MOCK: shop numbers and floor plan are placeholders until the mall shares the real layout.
 const floors = [
@@ -74,8 +71,16 @@ export interface Issue {
   couponUrl?: string
   /** True until the coupon image has been uploaded to that link. */
   couponPending?: boolean
-  /** Login that issued it (a shop, or the mall admin). */
+  /** Login that issued it (a shop, or the mall admin); "qr-form" when the customer's form made it. */
   issuedBy?: string
+  /** The bill amount in rupees, when it was entered. */
+  billAmount?: number
+  /** Where it was made: the desk, the desk releasing a QR customer, or the QR form by itself. */
+  source?: 'desk' | 'qr-release' | 'qr-form'
+  /** Shop name as printed on the coupon. */
+  shopLabel?: string
+  /** The QR form entry it was made for. */
+  entryId?: string
 }
 
 /**

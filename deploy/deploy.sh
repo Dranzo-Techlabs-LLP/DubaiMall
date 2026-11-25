@@ -138,7 +138,7 @@ ok "Website files copied to $WEB"
 # ---------------------------------------------------------------------------
 say "4/9  Installing the coupon server in ~/$APP_DIR_NAME"
 mkdir -p "$APP/data" "$APP/tmp"
-cp "$PKG/coupon-server/index.mjs" "$PKG/coupon-server/app.js" "$PKG/coupon-server/package.json" \
+cp "$PKG/coupon-server/index.mjs" "$PKG/coupon-server/shared.mjs" "$PKG/coupon-server/pdf.mjs" "$PKG/coupon-server/app.js" "$PKG/coupon-server/package.json" \
   "$PKG/coupon-server/.env.example" "$APP/"
 ENV_FILE="$APP/.env"
 cat >"$ENV_FILE" <<EOF

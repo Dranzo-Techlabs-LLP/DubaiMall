@@ -1,8 +1,8 @@
-import { Copy, Download, Eye, EyeOff, ExternalLink, QrCode, RefreshCw } from 'lucide-react'
+import { Copy, Download, Eye, EyeOff, ExternalLink, QrCode, RefreshCw, SlidersHorizontal } from 'lucide-react'
 import QRCode from 'qrcode'
 import { useEffect, useState } from 'react'
-import { getShopSettings, newShopCode, type ShopSettings, type User } from './api'
-import { shopById, shopRows } from './data'
+import { getShopSettings, newShopCode, saveFormOptions, type BillNoMode, type ShopSettings, type User } from './api'
+import { inr, RUPEES_PER_VOUCHER, shopById, shopRows } from './data'
 
 const shopTitle = (shopId: string) => {
   const s = shopById[shopId]
@@ -18,7 +18,7 @@ const loadImage = (src: string) =>
   })
 
 /** A printable poster: mall name, shop name, the QR and what to do. */
-async function posterPng(qr: string, shopId: string) {
+async function posterPng(qr: string, shopId: string, byAmount: boolean) {
   const W = 900
   const H = 1200
   const canvas = document.createElement('canvas')
@@ -46,11 +46,11 @@ async function posterPng(qr: string, shopId: string) {
   ctx.drawImage(await loadImage(qr), 190, 370, 520, 520)
   ctx.fillStyle = '#0e1838'
   ctx.font = '700 34px system-ui, sans-serif'
-  ctx.fillText('1. Scan  ·  2. Fill in your details', W / 2, 990)
+  ctx.fillText(byAmount ? '1. Scan  ·  2. Type your details & bill' : '1. Scan  ·  2. Type your details', W / 2, 990)
   ctx.fillText('3. Hand your phone to the shop staff', W / 2, 1040)
   ctx.fillStyle = '#565d73'
   ctx.font = '500 26px system-ui, sans-serif'
-  ctx.fillText('Your coupon arrives on WhatsApp', W / 2, 1110)
+  ctx.fillText(byAmount ? `Your coupons appear on your phone at once · 1 per ${inr(RUPEES_PER_VOUCHER)}` : 'Your coupon appears on your phone at once', W / 2, 1110)
   return canvas.toDataURL('image/png')
 }
 
@@ -99,7 +99,7 @@ export function ShopQr({ user }: { user: User }) {
   const download = async () => {
     if (!qr) return
     const a = document.createElement('a')
-    a.href = await posterPng(qr, shopId)
+    a.href = await posterPng(qr, shopId, settings?.byAmount ?? false)
     a.download = `dubai-mall-qr-${shopId}.png`
     a.click()
   }
@@ -113,6 +113,26 @@ export function ShopQr({ user }: { user: User }) {
     }
   }
 
+  const [saving, setSaving] = useState(false)
+  const saveOptions = async (options: { billNo?: BillNoMode; byAmount?: boolean }) => {
+    if (!settings) return
+    setSaving(true)
+    try {
+      setSettings(await saveFormOptions(shopId, options))
+      setError('')
+      flashOptions('Saved: the customer form shows this now')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not save the form options')
+    } finally {
+      setSaving(false)
+    }
+  }
+  const [optionsNote, setOptionsNote] = useState('')
+  const flashOptions = (text: string) => {
+    setOptionsNote(text)
+    setTimeout(() => setOptionsNote(''), 2500)
+  }
+
   const localAddress = settings && settings.entryUrl.startsWith('http://')
   const btn = 'inline-flex min-h-11 items-center gap-1.5 rounded-lg border border-line bg-white px-3 text-sm font-semibold text-ink hover:bg-sand'
 
@@ -124,8 +144,8 @@ export function ShopQr({ user }: { user: User }) {
             {admin ? 'Shop QR codes' : 'Your QR & shop code'}
           </h2>
           <p className="text-sm text-muted">
-            Customers scan the QR and type their details on their own phone. Your staff confirm with the shop code, and
-            the customer appears in “Customers from QR” above.
+            Each shop has its own QR. Customers scan it and type their details and bill amount on their own phone; your
+            staff check the bill and type the shop code, and the coupons appear on the customer’s phone straight away.
           </p>
         </div>
         {admin && (
@@ -218,12 +238,16 @@ export function ShopQr({ user }: { user: User }) {
               </p>
             </div>
 
+            <FormOptions settings={settings} saving={saving} note={optionsNote} onSave={(o) => void saveOptions(o)} />
+
             <ol className="grid gap-2 text-sm text-muted sm:grid-cols-2">
               {[
                 'Print the poster and keep it at the billing counter.',
-                'The customer scans it and types their name and WhatsApp number.',
-                'Staff type the shop code on the customer’s phone and press Submit.',
-                'The customer appears above: choose how many vouchers and release them on WhatsApp.',
+                `The customer scans it and types their name and WhatsApp number${settings.byAmount ? ' and the bill amount' : ''}${settings.billNo === 'required' ? ', with the bill number' : ''}.`,
+                'Staff check the bill, type the shop code on the customer’s phone and press the button.',
+                settings.byAmount
+                  ? `The coupons (1 per ${inr(RUPEES_PER_VOUCHER)}) appear on the customer’s phone with a PDF download, and in the Customers tab here.`
+                  : 'One coupon appears on the customer’s phone with a PDF download, and in the Customers tab here.',
               ].map((s, i) => (
                 <li key={i} className="flex gap-3">
                   <span className="grid size-6 shrink-0 place-items-center rounded-full bg-sand text-xs font-bold text-ink">{i + 1}</span>
@@ -235,5 +259,79 @@ export function ShopQr({ user }: { user: User }) {
         </div>
       )}
     </section>
+  )
+}
+
+const BILL_NO_CHOICES: { mode: BillNoMode; label: string; hint: string }[] = [
+  { mode: 'required', label: 'Required', hint: 'Customers must type the bill number.' },
+  { mode: 'optional', label: 'Optional', hint: 'The bill number field is shown, but can be left empty.' },
+  { mode: 'off', label: 'Don’t ask', hint: 'The form has no bill number field.' },
+]
+
+/** What the shop's customer form asks for. Changes show on the form straight away. */
+function FormOptions({
+  settings,
+  saving,
+  note,
+  onSave,
+}: {
+  settings: ShopSettings
+  saving: boolean
+  note: string
+  onSave: (options: { billNo?: BillNoMode; byAmount?: boolean }) => void
+}) {
+  const billHint = BILL_NO_CHOICES.find((c) => c.mode === settings.billNo)?.hint
+  return (
+    <div className="rounded-2xl border border-line bg-white p-5 shadow-card">
+      <p className="flex items-center gap-1.5 text-sm font-semibold text-muted">
+        <SlidersHorizontal className="size-4" aria-hidden /> Customer form
+      </p>
+
+      <div className="mt-3">
+        <p id="billno-label" className="text-sm font-semibold text-ink">
+          Bill number
+        </p>
+        <div role="radiogroup" aria-labelledby="billno-label" className="mt-1.5 inline-flex rounded-lg bg-sand p-1">
+          {BILL_NO_CHOICES.map((c) => (
+            <button
+              key={c.mode}
+              type="button"
+              role="radio"
+              aria-checked={settings.billNo === c.mode}
+              disabled={saving}
+              onClick={() => settings.billNo !== c.mode && onSave({ billNo: c.mode })}
+              className={`min-h-9 rounded-md px-3 text-sm font-semibold transition-colors disabled:cursor-progress ${
+                settings.billNo === c.mode ? 'bg-white text-ink shadow-card' : 'text-muted hover:text-ink'
+              }`}
+            >
+              {c.label}
+            </button>
+          ))}
+        </div>
+        <p className="mt-1 text-xs text-muted">{billHint}</p>
+      </div>
+
+      <label className="mt-4 flex cursor-pointer items-start gap-3">
+        <input
+          type="checkbox"
+          checked={settings.byAmount}
+          disabled={saving}
+          onChange={(e) => onSave({ byAmount: e.target.checked })}
+          className="mt-0.5 size-5 shrink-0 cursor-pointer accent-[#1f8f4e]"
+        />
+        <span>
+          <span className="block text-sm font-semibold text-ink">Vouchers by bill amount</span>
+          <span className="block text-xs text-muted">
+            {settings.byAmount
+              ? `On: the form asks for the bill amount and gives 1 voucher for every ${inr(RUPEES_PER_VOUCHER)}.`
+              : 'Off: the form has no bill amount, and each customer gets 1 voucher.'}
+          </span>
+        </span>
+      </label>
+
+      <p aria-live="polite" className="mt-2 min-h-5 text-xs font-semibold text-pine">
+        {saving ? 'Saving…' : note}
+      </p>
+    </div>
   )
 }
