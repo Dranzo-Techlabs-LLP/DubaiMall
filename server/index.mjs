@@ -1005,7 +1005,7 @@ function codesPage(issue, id, fresh) {
   ${
     fresh
       ? `<p class="done" role="status"><span class="tick" aria-hidden="true">✓</span><span><b>Submitted. ${n} coupon${plural} generated.</b>
-    <span>Download them now, or come back to this page any time. Refreshing it won’t make new coupons.</span></span></p>`
+    <span>Download ${n === 1 ? 'it' : 'them'} now, or come back to this page any time. Refreshing it won’t make new coupons.</span></span></p>`
       : ''
   }
   <dl class="summary">
